@@ -1,0 +1,2236 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>نظام الحضور</title>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script type="module">
+import { initializeApp }    from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import { getDatabase, ref, push, onValue, remove, set, get, update }
+  from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js';
+
+// ════════════════════════════════════
+//  FIREBASE CONFIG
+// ════════════════════════════════════
+const FB = {
+  apiKey:            "AIzaSyBMBppaDZpvvMPzyFYnibuJHGDOfi5UN-E",
+  authDomain:        "meeting-b216d.firebaseapp.com",
+  databaseURL:       "https://meeting-b216d-default-rtdb.firebaseio.com",
+  projectId:         "meeting-b216d",
+  storageBucket:     "meeting-b216d.firebasestorage.app",
+  messagingSenderId: "659329376332",
+  appId:             "1:659329376332:web:678c8bb41f487f11c994e9"
+};
+
+// ════════════════════════════════════
+//  SECURITY
+// ════════════════════════════════════
+async function sha256(s){
+  const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+let H_MGR='',H_ADM='';
+
+// ════════════════════════════════════
+//  STATE
+// ════════════════════════════════════
+const DEFAULT_DEPTS=[
+  {name:"مديرية التربية والتعليم",phone:"",code:""},
+  {name:"مديرية الصحة",phone:"",code:""},
+  {name:"مديرية الزراعة",phone:"",code:""},
+  {name:"مديرية البريد",phone:"",code:""},
+  {name:"مديرية الكهرباء",phone:"",code:""},
+  {name:"مديرية المياه",phone:"",code:""},
+  {name:"مديرية الاتصالات",phone:"",code:""},
+  {name:"مديرية التضامن",phone:"",code:""},
+  {name:"مديرية التموين",phone:"",code:""}
+];
+
+// إعدادات الحقول الإلزامية
+const DEFAULT_FIELDS = { dept:true, name:true, role:true, code:false };
+
+let app,db,fbConnected=false;
+let attendance={}, currentMeetId=null, meetingStart=null;
+let DEPARTMENTS=[], FIELDS={...DEFAULT_FIELDS};
+let selectedRole='', currentSub='present';
+let isUnlocked=false, isAdminMode=false;
+let failCount=0, lockedUntil=0;
+let deptHl=-1, filteredDepts=[];
+let authMode=null, authTarget=null;
+
+// ════════════════════════════════════
+//  INIT
+// ════════════════════════════════════
+window.addEventListener('DOMContentLoaded', async()=>{
+  H_MGR=await sha256('2409');
+  H_ADM=await sha256('2912');
+  document.getElementById('dateDisplay').textContent=
+    new Date().toLocaleDateString('ar-EG',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  DEPARTMENTS=JSON.parse(localStorage.getItem('depts_v7')||'null')||DEFAULT_DEPTS;
+  FIELDS=JSON.parse(localStorage.getItem('fields_v7')||'null')||DEFAULT_FIELDS;
+  renderDeptDd();
+  renderFieldToggles();
+  updateFormFields();
+  try{ await initFirebase(FB); await loadWelcomeMsg(); } catch(e){ console.error(e); }
+  loadOrgIdentity();
+  setTimeout(startTour,800);
+  document.addEventListener('click',e=>{
+    if(!document.getElementById('deptWrap')?.contains(e.target)) closeDeptDd();
+  });
+});
+
+// ════════════════════════════════════
+//  FIREBASE
+// ════════════════════════════════════
+async function initFirebase(config){
+  app=initializeApp(config);
+  db=getDatabase(app);
+  onValue(ref(db,'.info/connected'),snap=>{
+    fbConnected=snap.val()===true;
+    document.getElementById('syncDot').textContent=fbConnected?'🔥 مباشر':'⚡ بدون إنترنت';
+  });
+  await loadActiveMeeting();
+  // sync departments من Firebase لكل الأجهزة
+  onValue(ref(db,'departments'),snap=>{
+    if(snap.exists()) DEPARTMENTS=Object.values(snap.val());
+    else set(ref(db,'departments'),Object.fromEntries(DEFAULT_DEPTS.map((d,i)=>[i,d])));
+    localStorage.setItem('depts_v7',JSON.stringify(DEPARTMENTS));
+    renderDeptDd(); renderAdminDepts(); renderCodesTable();
+  });
+  // sync fields من Firebase لكل الأجهزة
+  onValue(ref(db,'fields'),snap=>{
+    if(snap.exists()) FIELDS=snap.val();
+    else set(ref(db,'fields'),DEFAULT_FIELDS);
+    localStorage.setItem('fields_v7',JSON.stringify(FIELDS));
+    renderFieldToggles(); updateFormFields();
+  });
+  // sync welcome message من Firebase لكل الأجهزة
+  onValue(ref(db,'settings/welcomeMsg'),snap=>{
+    const msg=snap.exists()?snap.val():'';
+    const el=document.getElementById('welcomeMsg');
+    if(el){ el.textContent=msg; el.parentElement.style.display=msg?'block':'none'; }
+    const inp=document.getElementById('welcomeMsgInput');
+    if(inp) inp.value=msg;
+  });
+}
+
+async function loadActiveMeeting(){
+  const params   = new URLSearchParams(window.location.search);
+  const urlMode  = params.get('mode');
+  const urlToken = params.get('m');
+  const urlMid   = params.get('mid');
+
+  // ══ وضع البروجيكتور ══
+  if(urlMode==='projector'){
+    document.querySelector('.header').style.display='none';
+    document.querySelector('.tabs').style.display='none';
+    document.querySelector('.main').style.padding='0';
+    document.querySelector('.main').style.maxWidth='100%';
+    document.querySelectorAll('.page').forEach(p=>p.style.display='none');
+    document.getElementById('page-projector').style.display='block';
+    await initProjectorPage(urlMid);
+    return;
+  }
+
+  const snap=await get(ref(db,'active_meeting'));
+  if(!snap.exists()){ await createNewMeeting(); }
+  else {
+    const data=snap.val();
+    currentMeetId=data.id; meetingStart=data.start;
+    const token=data.token||'';
+    // رابط المسجلين — لو الاجتماع قفل أو التوكن غلط يعرض "انتهى"
+    if(urlToken!==null){
+      if(data.closed||urlToken!==token){ showClosed(); return; }
+    }
+    // الرابط الرئيسي (بدون params) — ميتأثرش بإغلاق الاجتماع أبداً
+  }
+  listenAttendance();
+  updateStamp();
+  setInterval(updateStamp,30000);
+}
+
+// ════════════════════════════════════
+//  PROJECTOR PAGE (مدمج في نفس الملف)
+// ════════════════════════════════════
+let projectorAttendance={}, projectorDepts=[], projectorMeetStart=null;
+let projectorView='present'; // present | absent
+
+async function initProjectorPage(mid){
+  // جلب الجهات
+  onValue(ref(db,'departments'),snap=>{
+    if(snap.exists()) projectorDepts=Object.values(snap.val());
+    renderProjector();
+  });
+
+  // تحديد الاجتماع
+  if(mid){
+    // اجتماع محدد
+    onValue(ref(db,`meetings/${mid}/records`),snap=>{
+      projectorAttendance=snap.exists()?snap.val():{};
+      renderProjector();
+    });
+    const snap=await get(ref(db,`meetings/${mid}`));
+    if(snap.exists()) projectorMeetStart=snap.val().start;
+  } else {
+    // الاجتماع النشط
+    const actSnap=await get(ref(db,'active_meeting'));
+    if(actSnap.exists()){
+      const mid2=actSnap.val().id;
+      projectorMeetStart=actSnap.val().start;
+      onValue(ref(db,`meetings/${mid2}/records`),snap=>{
+        projectorAttendance=snap.exists()?snap.val():{};
+        renderProjector();
+      });
+    }
+  }
+  // تحديث الساعة
+  setInterval(()=>{
+    const el=document.getElementById('projClock');
+    if(el) el.textContent=new Date().toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+  },1000);
+}
+
+window.setProjectorView=function(v){
+  projectorView=v;
+  renderProjector();
+};
+
+function renderProjector(){
+  const recs=Object.values(projectorAttendance).sort((a,b)=>a.timestamp-b.timestamp);
+  const deptNames=projectorDepts.map(d=>d.name);
+  const presentD=new Set(recs.map(r=>r.dept));
+  const absentD=deptNames.filter(d=>!presentD.has(d));
+  const pct=deptNames.length?Math.round(presentD.size/deptNames.length*100):0;
+  const now=new Date().toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+
+  const presRows=recs.map((r,i)=>`
+    <tr style="border-bottom:1px solid #f0f0f2;animation:fadeIn .3s ease">
+      <td style="padding:14px 18px;color:#999;font-size:15px">${i+1}</td>
+      <td style="padding:14px 18px;font-weight:700;font-size:16px">${r.dept}</td>
+      <td style="padding:14px 18px;font-size:16px">${r.name||'—'}</td>
+      <td style="padding:14px 18px">
+        <span style="padding:5px 14px;border-radius:20px;font-size:13px;font-weight:700;background:${r.role==='president'?'#0a0a0a':'#333'};color:#fff">
+          ${r.role==='president'?'🔵 رئيس':'🟡 نائب'}
+        </span>
+      </td>
+      <td style="padding:14px 18px;color:#999;font-size:14px">${r.time}</td>
+    </tr>`).join('');
+
+  const absRows=absentD.map((d,i)=>`
+    <tr style="border-bottom:1px solid #f0f0f2">
+      <td style="padding:14px 18px;color:#999;font-size:15px">${i+1}</td>
+      <td style="padding:14px 18px;font-weight:700;font-size:16px;color:#cc2200">${d}</td>
+      <td style="padding:14px 18px" colspan="3">
+        <span style="padding:5px 14px;border-radius:20px;font-size:13px;font-weight:700;background:#fff0ee;color:#cc2200;border:1px solid rgba(204,34,0,.2)">❌ لم تُسجَّل</span>
+      </td>
+    </tr>`).join('');
+
+  const el=document.getElementById('projContent');
+  if(!el) return;
+  el.innerHTML=`
+    <div style="font-family:'Cairo',sans-serif;background:#fff;min-height:100vh;padding:20px">
+      <style>@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}</style>
+
+      <!-- HEADER -->
+      <div style="background:#0a0a0a;border-radius:16px;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:12px">
+        <div style="font-size:20px;font-weight:900;color:#fff">🏛️ اجتماع المجلس التنفيذي — محافظة الغربية</div>
+        <div id="projClock" style="font-size:28px;font-weight:900;color:#fff">${now}</div>
+      </div>
+
+      <!-- STATS -->
+      <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap">
+        <div style="flex:1;min-width:110px;background:#0a0a0a;border-radius:14px;padding:16px;text-align:center">
+          <div style="font-size:38px;font-weight:900;color:#fff">${recs.length}</div>
+          <div style="font-size:11px;color:rgba(255,255,255,.5);margin-top:3px;font-weight:600">إجمالي الأفراد</div>
+        </div>
+        <div style="flex:1;min-width:110px;background:#0a0a0a;border-radius:14px;padding:16px;text-align:center">
+          <div style="font-size:38px;font-weight:900;color:#fff">${presentD.size}</div>
+          <div style="font-size:11px;color:rgba(255,255,255,.5);margin-top:3px;font-weight:600">جهات حضرت</div>
+        </div>
+        <div style="flex:1;min-width:110px;background:#0a0a0a;border-radius:14px;padding:16px;text-align:center">
+          <div style="font-size:38px;font-weight:900;color:#ff6b6b">${absentD.length}</div>
+          <div style="font-size:11px;color:rgba(255,255,255,.5);margin-top:3px;font-weight:600">جهات غائبة</div>
+        </div>
+        <div style="flex:1;min-width:110px;background:#0a0a0a;border-radius:14px;padding:16px;text-align:center">
+          <div style="font-size:38px;font-weight:900;color:#fff">${pct}%</div>
+          <div style="font-size:11px;color:rgba(255,255,255,.5);margin-top:3px;font-weight:600">نسبة الحضور</div>
+        </div>
+      </div>
+
+      <!-- PROGRESS BAR -->
+      <div style="height:8px;background:#e5e5e7;border-radius:4px;margin-bottom:16px;overflow:hidden">
+        <div style="height:100%;background:#0a0a0a;border-radius:4px;width:${pct}%;transition:width .5s"></div>
+      </div>
+
+      <!-- TOGGLE -->
+      <div style="display:flex;gap:10px;margin-bottom:16px">
+        <button onclick="setProjectorView('present')"
+          style="flex:1;padding:13px;border-radius:12px;border:2px solid ${projectorView==='present'?'#0a0a0a':'#e5e5e7'};background:${projectorView==='present'?'#0a0a0a':'#fff'};color:${projectorView==='present'?'#fff':'#888'};font-family:'Cairo',sans-serif;font-size:15px;font-weight:700;cursor:pointer;transition:all .2s">
+          ✅ الحاضرون (${recs.length})
+        </button>
+        <button onclick="setProjectorView('absent')"
+          style="flex:1;padding:13px;border-radius:12px;border:2px solid ${projectorView==='absent'?'#cc2200':'#e5e5e7'};background:${projectorView==='absent'?'#cc2200':'#fff'};color:${projectorView==='absent'?'#fff':'#888'};font-family:'Cairo',sans-serif;font-size:15px;font-weight:700;cursor:pointer;transition:all .2s">
+          ❌ لم يحضروا (${absentD.length})
+        </button>
+      </div>
+
+      <!-- TABLE -->
+      <div style="background:#fff;border:1px solid #e5e5e7;border-radius:16px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)">
+        <div style="background:#0a0a0a;padding:14px 18px">
+          <div style="font-size:15px;font-weight:800;color:#fff">
+            ${projectorView==='present'?`✅ الحاضرون — ${recs.length} فرد`:`❌ الجهات الغائبة — ${absentD.length} جهة`}
+          </div>
+        </div>
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:14px">
+            <thead>
+              <tr style="background:#f5f5f7">
+                ${projectorView==='present'
+                  ?'<th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">#</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الجهة</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الاسم</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الصفة</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الوقت</th>'
+                  :'<th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">#</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الجهة</th><th style="padding:12px 18px;text-align:right;font-size:12px;color:#888">الحالة</th><th></th><th></th>'}
+              </tr>
+            </thead>
+            <tbody>${projectorView==='present'?presRows:absRows}</tbody>
+          </table>
+          ${projectorView==='present'&&!recs.length?'<div style="padding:40px;text-align:center;color:#ccc;font-size:16px">لا يوجد حضور مسجل بعد</div>':''}
+          ${projectorView==='absent'&&!absentD.length?'<div style="padding:40px;text-align:center;color:#ccc;font-size:16px">🎉 جميع الجهات حضرت!</div>':''}
+        </div>
+      </div>
+    </div>`;
+}
+
+function showClosed(){
+  document.querySelector('.tabs').style.display='none';
+  document.querySelector('.main').innerHTML=`
+    <div style="text-align:center;padding:80px 20px">
+      <div style="font-size:80px;margin-bottom:20px">🔒</div>
+      <div style="font-size:22px;font-weight:900;color:var(--error);margin-bottom:12px">الاجتماع انتهى</div>
+      <div style="font-size:14px;color:var(--muted);line-height:1.8">هذا الرابط لم يعد صالحاً.<br>تواصل مع مسؤول الاجتماع.</div>
+    </div>`;
+}
+
+function generateToken(){ return Math.random().toString(36).substring(2,10); }
+
+async function createNewMeeting(){
+  meetingStart=new Date().toISOString();
+  const meetRef=push(ref(db,'meetings'));
+  currentMeetId=meetRef.key;
+  const token=generateToken();
+  await set(ref(db,'active_meeting'),{id:currentMeetId,start:meetingStart,name:getMeetingName(meetingStart),token,closed:false});
+  await set(meetRef,{start:meetingStart,name:getMeetingName(meetingStart),token,records:{}});
+}
+
+function listenAttendance(){
+  onValue(ref(db,`meetings/${currentMeetId}/records`),snap=>{
+    attendance=snap.exists()?snap.val():{};
+    renderTable(); updateStamp();
+  });
+}
+
+function getMeetingName(start){
+  const d=new Date(start||meetingStart);
+  return `اجتماع المجلس التنفيذي لمحافظة الغربية يوم ${d.toLocaleDateString('ar-EG',{weekday:'long'})} بتاريخ ${d.toLocaleDateString('ar-EG',{year:'numeric',month:'long',day:'numeric'})}`;
+}
+
+// ════════════════════════════════════
+//  STAMP
+// ════════════════════════════════════
+function updateStamp(){
+  if(!meetingStart) return;
+  const s=new Date(meetingStart);
+  document.getElementById('stDate').textContent=s.toLocaleDateString('ar-EG',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  document.getElementById('stStart').textContent=s.toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+  const recs=Object.values(attendance);
+  if(recs.length){
+    const ts=recs.map(r=>r.timestamp);
+    document.getElementById('stFirst').textContent=new Date(Math.min(...ts)).toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+    document.getElementById('stLast').textContent=new Date(Math.max(...ts)).toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+  } else { document.getElementById('stFirst').textContent='—'; document.getElementById('stLast').textContent='—'; }
+  const el=Math.floor((Date.now()-s.getTime())/60000);
+  document.getElementById('stElapsed').textContent=`${Math.floor(el/60)}س ${el%60}د`;
+}
+
+// ════════════════════════════════════
+//  FIELD TOGGLES
+// ════════════════════════════════════
+function renderFieldToggles(){
+  const el=document.getElementById('fieldToggles');
+  if(!el) return;
+  const labels={dept:'الجهة',name:'الاسم',role:'الصفة',code:'الكود السري'};
+  el.innerHTML=Object.entries(labels).map(([k,v])=>`
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--surface2);border-radius:10px;border:1px solid var(--border);margin-bottom:8px">
+      <span style="font-weight:700;font-size:14px">${v}</span>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:12px;color:var(--muted)">${FIELDS[k]?'إلزامي':'اختياري'}</span>
+        <div onclick="toggleField('${k}')" style="width:44px;height:24px;border-radius:12px;background:${FIELDS[k]?'var(--accent)':'var(--border)'};cursor:pointer;transition:all .2s;position:relative">
+          <div style="width:18px;height:18px;border-radius:50%;background:#fff;position:absolute;top:3px;${FIELDS[k]?'left:23px':'left:3px'};transition:all .2s"></div>
+        </div>
+      </div>
+    </div>`).join('');
+}
+
+window.toggleField=async function(key){
+  // الجهة فقط دايماً إلزامية — الاسم وغيره قابل للتغيير
+  if(key==='dept'){ alert('الجهة إلزامية دائماً ولا يمكن تعطيلها'); return; }
+  FIELDS[key]=!FIELDS[key];
+  localStorage.setItem('fields_v7',JSON.stringify(FIELDS));
+  if(db) await set(ref(db,'fields'),FIELDS);
+  renderFieldToggles(); updateFormFields();
+};
+
+function updateFormFields(){
+  // الاسم
+  const nameGroup=document.getElementById('nameGroup');
+  if(nameGroup) nameGroup.style.display=FIELDS.name?'':'none';
+  // الصفة
+  const roleGroup=document.getElementById('roleGroup');
+  const roleLabel=document.getElementById('roleLabel');
+  if(roleGroup){ roleGroup.style.display=FIELDS.role?'':'none'; if(roleLabel) roleLabel.style.display=FIELDS.role?'':'none'; }
+  // الكود
+  const codeGroup=document.getElementById('codeGroup');
+  if(codeGroup) codeGroup.style.display=FIELDS.code?'':'none';
+}
+
+// ════════════════════════════════════
+//  DEPT SEARCH
+// ════════════════════════════════════
+function renderDeptDd(filter=''){
+  filteredDepts=filter?DEPARTMENTS.filter(d=>d.name.includes(filter)):[...DEPARTMENTS];
+  deptHl=-1;
+  const dd=document.getElementById('deptDd');
+  if(!dd) return;
+  dd.innerHTML=filteredDepts.length===0
+    ?'<div class="dept-option no-res">لا توجد نتائج</div>'
+    :filteredDepts.map((d,i)=>`<div class="dept-option" onclick="selectDept('${d.name.replace(/'/g,"\\'")}','${i}')">${d.name}</div>`).join('');
+}
+window.filterDepts=function(){ document.getElementById('deptVal').value=''; renderDeptDd(document.getElementById('deptSearch').value.trim()); openDeptDd(); };
+function openDeptDd(){ renderDeptDd(document.getElementById('deptSearch').value.trim()); document.getElementById('deptDd').classList.add('open'); }
+function closeDeptDd(){ document.getElementById('deptDd')?.classList.remove('open'); }
+window.openDeptDd=openDeptDd;
+window.selectDept=function(n){ document.getElementById('deptSearch').value=n; document.getElementById('deptVal').value=n; closeDeptDd(); };
+window.deptNav=function(e){
+  const opts=document.querySelectorAll('#deptDd .dept-option:not(.no-res)');
+  if(e.key==='ArrowDown') deptHl=Math.min(deptHl+1,opts.length-1);
+  else if(e.key==='ArrowUp') deptHl=Math.max(deptHl-1,0);
+  else if(e.key==='Enter'&&deptHl>=0){ window.selectDept(filteredDepts[deptHl].name,deptHl); e.preventDefault(); return; }
+  else if(e.key==='Escape'){ closeDeptDd(); return; }
+  opts.forEach((o,i)=>o.classList.toggle('hl',i===deptHl));
+};
+
+// ════════════════════════════════════
+//  REGISTER
+// ════════════════════════════════════
+window.registerAttendance=async function(){
+  hideAlerts();
+  const dept=document.getElementById('deptVal').value.trim()||document.getElementById('deptSearch').value.trim();
+  const name=document.getElementById('nameInput').value.trim();
+  const note=document.getElementById('noteInput').value.trim();
+  if(!dept) return toast('من فضلك اختر الجهة أولاً','error');
+  if(FIELDS.name && !name) return toast('من فضلك اكتب اسمك الكامل','error');
+  if(FIELDS.role && !selectedRole) return toast('من فضلك اختر صفتك في الاجتماع','error');
+
+  // التحقق من الكود (إلا للأدمن)
+  if(!isAdminMode && FIELDS.code){
+    const entered=(document.getElementById('deptCode')?.value.trim()||'').toUpperCase();
+    const deptObj=DEPARTMENTS.find(d=>d.name===dept);
+    if(deptObj && deptObj.code){
+      if(!entered) return toast('من فضلك أدخل الكود السري للجهة','error');
+      if(entered!==deptObj.code.toUpperCase()) return toast('❌ الكود السري غير صحيح','error');
+    }
+  }
+
+  // منع تكرار رئيس الجهة
+  const recs=Object.values(attendance);
+  if(!selectedRole || selectedRole==='president'){
+    const dupPres=recs.find(a=>a.dept===dept&&a.role==='president');
+    if(dupPres){
+      if(selectedRole==='president') return toast(`تم تسجيل رئيس "${dept}" مسبقاً (${dupPres.name})`,'error');
+    }
+  }
+
+  // تحذير للأدمن لو الجهة مسجلة
+  if(isAdminMode){
+    const deptRecs=recs.filter(a=>a.dept===dept);
+    if(deptRecs.length>0 && selectedRole==='president'){
+      const dupPres=deptRecs.find(a=>a.role==='president');
+      if(dupPres && !confirm(`⚠️ "${dept}" سجّل رئيسها بالفعل (${dupPres.name})\nهل تريد تسجيل رئيس آخر؟`)) return;
+    }
+    if(selectedRole!=='president'){
+      const samePerson=recs.find(a=>a.dept===dept&&a.name===name);
+      if(samePerson && !confirm(`⚠️ "${name}" من "${dept}" مسجل بالفعل\nهل تريد التسجيل مرة أخرى؟`)) return;
+    }
+  }
+
+  // منع تكرار نفس الجهاز (إلا للأدمن)
+  if(!isAdminMode){
+    const reg=localStorage.getItem(`reg_${currentMeetId}`);
+    if(reg){
+      document.getElementById('page-register').innerHTML=`
+        <div class="success-page">
+          <div style="width:96px;height:96px;border-radius:50%;background:linear-gradient(135deg,#f59e0b,#d97706);display:flex;align-items:center;justify-content:center;font-size:44px;margin:0 auto 20px;box-shadow:0 8px 28px rgba(217,119,6,.3);animation:popIn .5s cubic-bezier(.175,.885,.32,1.275)">⚠️</div>
+          <div style="font-size:22px;font-weight:900;color:var(--text);margin-bottom:6px">تم تسجيل حضورك مسبقاً</div>
+          <div style="font-size:14px;color:var(--muted);margin-bottom:20px">لا يمكن التسجيل أكثر من مرة</div>
+          <div class="success-card" style="max-width:380px;margin:0 auto">
+            <div class="success-row">
+              <span class="success-row-label">البيانات المسجّلة</span>
+              <span class="success-row-value">${reg}</span>
+            </div>
+          </div>
+          <div class="success-locked" style="background:var(--warn-light);border-color:rgba(217,119,6,.2);color:var(--warn)">
+            <span>🔒</span><span>تواصل مع مسؤول الاجتماع لو في مشكلة</span>
+          </div>
+        </div>`;
+      document.querySelector('.tabs').style.display='none';
+      return;
+    }
+  }
+
+  const now=new Date();
+  const record={
+    dept, name,
+    role: selectedRole||'غير محدد',
+    roleLabel: selectedRole==='president'?'رئيس الجهة':selectedRole==='deputy'?'نائب عن الرئيس':'غير محدد',
+    note,
+    time: now.toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'}),
+    date: now.toLocaleDateString('ar-EG'),
+    timestamp: Date.now()
+  };
+
+  if(!db) return toast('⚠️ لم يتم الاتصال بـ Firebase','error');
+
+  try{
+    await push(ref(db,`meetings/${currentMeetId}/records`),record);
+    if(!isAdminMode){
+      localStorage.setItem(`reg_${currentMeetId}`,`${name} — ${dept}`);
+      const now2=new Date();
+      document.getElementById('page-register').innerHTML=`
+        <div class="success-page">
+          <div class="success-circle">✓</div>
+          <div style="font-size:24px;font-weight:900;color:var(--text);margin-bottom:6px">تم تسجيل حضورك!</div>
+          <div style="font-size:14px;color:var(--muted);margin-bottom:20px">مرحباً بك في الاجتماع</div>
+          <div class="success-card">
+            <div class="success-row">
+              <span class="success-row-label">الاسم</span>
+              <span class="success-row-value">${name}</span>
+            </div>
+            <div class="success-row">
+              <span class="success-row-label">الجهة</span>
+              <span class="success-row-value">${dept}</span>
+            </div>
+            ${record.roleLabel!=='غير محدد'?`
+            <div class="success-row">
+              <span class="success-row-label">الصفة</span>
+              <span class="success-row-value">${record.roleLabel}</span>
+            </div>`:''}
+            <div class="success-row">
+              <span class="success-row-label">وقت التسجيل</span>
+              <span class="success-row-value">${now2.toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'})}</span>
+            </div>
+            <div class="success-row">
+              <span class="success-row-label">التاريخ</span>
+              <span class="success-row-value">${now2.toLocaleDateString('ar-EG',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}</span>
+            </div>
+          </div>
+          <div class="success-locked">
+            <span>🔒</span>
+            <span>تم إغلاق صفحة التسجيل — شكراً لحضورك</span>
+          </div>
+        </div>`;
+      document.querySelector('.tabs').style.display='none';
+    } else {
+      toast(`✅ تم تسجيل ${name} — ${dept} 🔥`);
+      document.getElementById('deptSearch').value=''; document.getElementById('deptVal').value='';
+      document.getElementById('nameInput').value=''; document.getElementById('noteInput').value='';
+      if(document.getElementById('deptCode')) document.getElementById('deptCode').value='';
+      selectedRole='';
+      document.getElementById('btnPres').className='role-btn';
+      document.getElementById('btnDep').className='role-btn';
+      setTimeout(hideAlerts,5000);
+    }
+  } catch(e){ toast('❌ فشل التسجيل — تأكد من الاتصال'); }
+};
+
+// ════════════════════════════════════
+//  RENDER TABLE
+// ════════════════════════════════════
+function renderTable(){
+  const recs=Object.entries(attendance); // [key, record]
+  const deptNames=DEPARTMENTS.map(d=>d.name);
+  // الجهات الفريدة اللي حضرت
+  const presentDepts=new Set(recs.map(([,r])=>r.dept));
+  const absentDepts=deptNames.filter(d=>!presentDepts.has(d));
+  const pct=deptNames.length?Math.round(presentDepts.size/deptNames.length*100):0;
+
+  // الأرقام
+  document.getElementById('stPersons').textContent=recs.length;      // عدد الأفراد
+  document.getElementById('stPresent').textContent=presentDepts.size; // جهات حضرت
+  document.getElementById('stAbsent').textContent=absentDepts.length; // جهات غائبة
+  document.getElementById('stPct').textContent=pct+'%';
+  document.getElementById('cntPres').textContent=recs.length;
+  document.getElementById('cntAbs').textContent=absentDepts.length;
+
+  // صوت عند تسجيل جديد
+  const newCount=Object.keys(attendance).length;
+  if(newCount>lastCount && lastCount>0) playRegSound();
+  lastCount=newCount;
+
+  // رسم الدونات
+  drawChart();
+  const tbody=document.getElementById('presentTbody');
+  const emptyP=document.getElementById('emptyPres');
+  if(!recs.length){ tbody.innerHTML=''; emptyP.style.display='block'; }
+  else{
+    emptyP.style.display='none';
+    tbody.innerHTML=[...recs].sort((a,b)=>a[1].timestamp-b[1].timestamp).map(([key,r],i)=>`
+      <tr>
+        <td><span class="row-num">${i+1}</span></td>
+        <td style="font-weight:600;font-size:13px">${r.dept}</td>
+        <td style="font-weight:600">${r.name}</td>
+        <td><span class="badge ${r.role==='president'?'b-pres':'b-dep'}">${r.role==='president'?'🔵 رئيس':'🟡 نائب'}</span></td>
+        <td style="color:var(--muted);font-size:12px">${r.time}</td>
+        <td>
+          ${isUnlocked?`<button onclick="deleteRecord('${key}')" style="background:rgba(255,77,109,.1);border:1px solid rgba(255,77,109,.3);color:var(--error);border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer;font-family:'Cairo',sans-serif">حذف</button>`:''}
+        </td>
+      </tr>`).join('');
+  }
+
+  // جدول الغائبين
+  const tbodyA=document.getElementById('absentTbody');
+  const emptyA=document.getElementById('emptyAbs');
+  if(!absentDepts.length){ tbodyA.innerHTML=''; emptyA.style.display='block'; }
+  else{
+    emptyA.style.display='none';
+    tbodyA.innerHTML=absentDepts.map((d,i)=>`
+      <tr>
+        <td><span class="row-num">${i+1}</span></td>
+        <td style="font-weight:600">${d}</td>
+        <td><span class="badge b-abs">❌ لم تُسجَّل</span></td>
+      </tr>`).join('');
+  }
+}
+
+// ════════════════════════════════════
+//  GUIDED TOUR
+// ════════════════════════════════════
+const TOUR_STEPS = [
+  { el:'deptWrap',   title:'الخطوة 1 — اختر جهتك',           text:'اضغط هنا وابحث عن اسم الجهة التابع لها', pos:'above' },
+  { el:'nameInput',  title:'الخطوة 2 — اسمك بالكامل',         text:'اكتب اسمك الكامل في هذه الخانة',          pos:'above' },
+  { el:'roleGroup',  title:'الخطوة 3 — صفتك في الاجتماع',    text:'اختر رئيس الجهة أو نائب عن الرئيس',       pos:'above' },
+  { el:'codeGroup',  title:'الخطوة 4 — الكود السري',          text:'أدخل الكود السري الموجود مع جدول الأعمال', pos:'above', skipIfHidden:true },
+  { el:'regBtn',     title:'الخطوة الأخيرة — سجّل حضورك',    text:'اضغط هنا لتأكيد تسجيل حضورك',             pos:'above' },
+];
+let tourStep=0;
+
+function startTour(){
+  if(localStorage.getItem('tour_done')) return;
+  tourStep=0;
+  showTourStep();
+}
+
+function showTourStep(){
+  removeTourOverlay();
+  while(tourStep<TOUR_STEPS.length){
+    const s=TOUR_STEPS[tourStep];
+    const el=document.getElementById(s.el);
+    if(!el||(s.skipIfHidden&&el.style.display==='none')){ tourStep++; continue; }
+    break;
+  }
+  if(tourStep>=TOUR_STEPS.length){ endTour(); return; }
+
+  const s=TOUR_STEPS[tourStep];
+  const el=document.getElementById(s.el);
+  if(!el){ endTour(); return; }
+
+  // scroll للعنصر أولاً
+  el.scrollIntoView({behavior:'smooth',block:'center'});
+
+  setTimeout(()=>{
+    removeTourOverlay();
+    const rect=el.getBoundingClientRect();
+
+    // overlay
+    const overlay=document.createElement('div');
+    overlay.id='tourOverlay';
+    overlay.style.cssText='position:fixed;inset:0;z-index:2000;pointer-events:none';
+    document.body.appendChild(overlay);
+
+    // هايلايت
+    const hl=document.createElement('div');
+    hl.id='tourHL';
+    hl.style.cssText=`position:fixed;top:${rect.top-6}px;left:${rect.left-6}px;width:${rect.width+12}px;height:${rect.height+12}px;border:2px solid #00d4aa;border-radius:12px;box-shadow:0 0 0 4000px rgba(0,0,0,.75);z-index:2001;pointer-events:none`;
+    document.body.appendChild(hl);
+
+    // tooltip — دايماً فوق العنصر
+    const tip=document.createElement('div');
+    tip.id='tourTip';
+    const tipW=Math.min(300,window.innerWidth-20);
+    const tipLeft=Math.max(10,Math.min(rect.left,window.innerWidth-tipW-10));
+
+    // حساب الموضع فوق العنصر
+    const tipTop=rect.top-12; // هيتحول بـ translateY(-100%)
+
+    tip.style.cssText=`position:fixed;z-index:2002;top:${tipTop}px;left:${tipLeft}px;transform:translateY(-100%);width:${tipW}px;background:#111827;border:1.5px solid #00d4aa;border-radius:16px;padding:16px 18px;box-shadow:0 8px 32px rgba(0,212,170,.25);font-family:'Cairo',sans-serif`;
+
+    const validSteps=TOUR_STEPS.filter(x=>!x.skipIfHidden||(document.getElementById(x.el)?.style.display!=='none')).length;
+    tip.innerHTML=`
+      <div style="position:absolute;bottom:-10px;right:24px;width:0;height:0;border-left:10px solid transparent;border-right:10px solid transparent;border-top:10px solid #00d4aa"></div>
+      <div style="font-size:13px;font-weight:900;color:#00d4aa;margin-bottom:5px">${s.title}</div>
+      <div style="font-size:13px;color:#e8edf5;margin-bottom:14px;line-height:1.6">${s.text}</div>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <span style="font-size:11px;color:#6b7a99">${tourStep+1} من ${validSteps}</span>
+        <div style="display:flex;gap:8px">
+          <button onclick="endTour()" style="padding:6px 13px;background:transparent;border:1px solid #1e2d45;border-radius:8px;color:#6b7a99;font-family:'Cairo',sans-serif;font-size:12px;cursor:pointer;pointer-events:all">تخطي</button>
+          <button onclick="nextTourStep()" style="padding:6px 16px;background:linear-gradient(135deg,#00d4aa,#0080ff);border:none;border-radius:8px;color:#fff;font-family:'Cairo',sans-serif;font-size:13px;font-weight:700;cursor:pointer;pointer-events:all">${tourStep===TOUR_STEPS.length-1?'انتهى ✓':'التالي ←'}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(tip);
+  }, 400);
+}
+
+function removeTourOverlay(){
+  ['tourOverlay','tourHL','tourTip'].forEach(id=>document.getElementById(id)?.remove());
+}
+window.nextTourStep=function(){ tourStep++; showTourStep(); };
+window.endTour=function(){ removeTourOverlay(); localStorage.setItem('tour_done','1'); };
+window.restartTour=function(){ localStorage.removeItem('tour_done'); tourStep=0; showTourStep(); };
+async function loadWelcomeMsg(){
+  const snap=await get(ref(db,'settings/welcomeMsg'));
+  const msg=snap.exists()?snap.val():'';
+  const el=document.getElementById('welcomeMsg');
+  if(el){ el.textContent=msg; el.parentElement.style.display=msg?'block':'none'; }
+  const inp=document.getElementById('welcomeMsgInput');
+  if(inp) inp.value=msg;
+}
+window.saveWelcomeMsg=async function(){
+  const msg=document.getElementById('welcomeMsgInput').value.trim();
+  await set(ref(db,'settings/welcomeMsg'),msg);
+  const el=document.getElementById('welcomeMsg');
+  if(el){ el.textContent=msg; el.parentElement.style.display=msg?'block':'none'; }
+  toast('✅ تم حفظ رسالة الترحيب');
+};
+
+// ════════════════════════════════════
+//  ORG IDENTITY
+// ════════════════════════════════════
+function loadOrgIdentity(){
+  const name=localStorage.getItem('org_name')||'نظام الحضور';
+  const icon=localStorage.getItem('org_icon')||'📋';
+  document.getElementById('headerTitle').textContent=name;
+  document.getElementById('headerLogo').textContent=icon;
+  const inp=document.getElementById('orgNameInput');
+  const ico=document.getElementById('orgIconInput');
+  if(inp) inp.value=name;
+  if(ico) ico.value=icon;
+  updateOrgPreview();
+}
+window.updateOrgPreview=function(){
+  const name=document.getElementById('orgNameInput')?.value||'نظام الحضور';
+  const icon=document.getElementById('orgIconInput')?.value||'📋';
+  const pName=document.getElementById('previewName');
+  const pLogo=document.getElementById('previewLogo');
+  if(pName) pName.textContent=name;
+  if(pLogo) pLogo.textContent=icon;
+};
+window.saveOrgIdentity=function(){
+  const name=document.getElementById('orgNameInput').value.trim()||'نظام الحضور';
+  const icon=document.getElementById('orgIconInput').value.trim()||'📋';
+  localStorage.setItem('org_name',name);
+  localStorage.setItem('org_icon',icon);
+  document.getElementById('headerTitle').textContent=name;
+  document.getElementById('headerLogo').textContent=icon;
+  updateOrgPreview();
+  toast('✅ تم حفظ هوية المنظمة');
+};
+
+// ════════════════════════════════════
+//  QR CODE
+// ════════════════════════════════════
+window.generateQRCode=async function(){
+  const snap=await get(ref(db,'active_meeting'));
+  if(!snap.exists()) return;
+  const token=snap.val().token||'';
+  const base=window.location.origin+window.location.pathname;
+  const link=`${base}?m=${token}`;
+  document.getElementById('qrLinkDisplay').textContent=link;
+  const qrUrl=`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(link)}&bgcolor=ffffff&color=000000&margin=10`;
+  document.getElementById('qrDisplay').innerHTML=`<img id="qrImg" src="${qrUrl}" style="width:200px;height:200px;border-radius:12px" alt="QR Code">`;
+};
+window.downloadQR=function(){
+  const img=document.getElementById('qrImg');
+  if(!img){ alert('اضغط "توليد QR" أولاً'); return; }
+  const a=document.createElement('a'); a.href=img.src; a.download='qr-attendance.png'; a.click();
+};
+window.printQR=function(){
+  const img=document.getElementById('qrImg');
+  if(!img){ alert('اضغط "توليد QR" أولاً'); return; }
+  const orgName=localStorage.getItem('org_name')||'نظام الحضور';
+  const html=`<!DOCTYPE html><html dir="rtl"><head><meta charset="UTF-8">
+<style>@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap');
+body{font-family:'Cairo',sans-serif;text-align:center;padding:40px;background:#fff}
+h2{font-size:24px;font-weight:900;margin-bottom:8px}
+h3{font-weight:500;color:#555;font-size:16px;margin-bottom:24px}
+img{border:2px solid #eee;border-radius:16px}
+p{color:#999;font-size:12px;margin-top:16px}
+@media print{body{padding:20px}}</style></head>
+<body><h2>${orgName}</h2><h3>امسح الكود لتسجيل حضورك</h3>
+<img src="${img.src}" style="width:260px;height:260px">
+<p>لا تشارك هذا الكود مع غيرك</p>
+<script>window.onload=()=>window.print()<\/script></body></html>`;
+  const w=window.open('','_blank'); w.document.write(html); w.document.close();
+};
+
+// ════════════════════════════════════
+//  SOUND NOTIFICATION
+// ════════════════════════════════════
+let lastCount=0;
+function playRegSound(){
+  try{
+    const ctx=new(window.AudioContext||window.webkitAudioContext)();
+    const o=ctx.createOscillator();
+    const g=ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.type='sine'; o.frequency.setValueAtTime(880,ctx.currentTime);
+    o.frequency.setValueAtTime(1100,ctx.currentTime+0.1);
+    g.gain.setValueAtTime(0.3,ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.4);
+    o.start(ctx.currentTime); o.stop(ctx.currentTime+0.4);
+  }catch(e){}
+}
+
+// ════════════════════════════════════
+//  PRINT ATTENDANCE
+// ════════════════════════════════════
+window.printAttendance=function(){
+  const recs=Object.values(attendance).sort((a,b)=>a.timestamp-b.timestamp);
+  const deptNames=DEPARTMENTS.map(d=>d.name);
+  const presentD=new Set(recs.map(r=>r.dept));
+  const absentD=deptNames.filter(d=>!presentD.has(d));
+  const dateStr=new Date(meetingStart).toLocaleDateString('ar-EG',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  const timeStr=new Date(meetingStart).toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+  const pct=deptNames.length?Math.round(presentD.size/deptNames.length*100):0;
+
+  const presRows=recs.map((r,i)=>`
+    <tr>
+      <td>${i+1}</td><td>${r.dept}</td><td>${r.name}</td>
+      <td>${r.role==='president'?'رئيس الجهة':'نائب عن الرئيس'}</td>
+      <td>${r.time}</td><td style="width:80px;border-bottom:1px solid #ccc"></td>
+    </tr>`).join('');
+  const absRows=absentD.map((d,i)=>`<tr><td>${i+1}</td><td>${d}</td><td></td><td></td></tr>`).join('');
+
+  const html=`<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8">
+<style>@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Cairo',sans-serif;padding:20px;background:#fff;color:#111;font-size:13px}
+.header{text-align:center;margin-bottom:20px;border-bottom:2px solid #0a3d62;padding-bottom:14px}
+h1{font-size:18px;font-weight:900;margin-bottom:4px}
+.sub{font-size:12px;color:#555}
+.stats{display:flex;gap:20px;justify-content:center;margin:14px 0;flex-wrap:wrap}
+.stat{text-align:center;background:#f0f7ff;border-radius:8px;padding:8px 16px}
+.stat-n{font-size:22px;font-weight:900;color:#0a3d62}
+.stat-l{font-size:11px;color:#666}
+table{width:100%;border-collapse:collapse;margin-bottom:20px}
+thead th{background:#0a3d62;color:#fff;padding:9px 12px;text-align:right;font-size:12px}
+tbody tr:nth-child(even){background:#f8faff}
+td{padding:8px 12px;border-bottom:1px solid #e0e8f0;font-size:12px}
+td:first-child{text-align:center;color:#888;font-size:11px}
+.section-title{font-size:14px;font-weight:800;margin:16px 0 8px;color:#0a3d62;border-right:4px solid #0a3d62;padding-right:8px}
+.footer{text-align:center;font-size:10px;color:#aaa;margin-top:20px;border-top:1px solid #eee;padding-top:10px}
+.sig-row td{height:50px;border-bottom:1px solid #999}
+@media print{body{padding:8px}}
+</style></head><body>
+<div class="header">
+  <h1>كشف حضور — اجتماع المجلس التنفيذي لمحافظة الغربية</h1>
+  <div class="sub">${dateStr} | بدأ الاجتماع: ${timeStr}</div>
+</div>
+<div class="stats">
+  <div class="stat"><div class="stat-n">${recs.length}</div><div class="stat-l">إجمالي الأفراد</div></div>
+  <div class="stat"><div class="stat-n">${presentD.size}</div><div class="stat-l">جهات حضرت</div></div>
+  <div class="stat"><div class="stat-n">${absentD.length}</div><div class="stat-l">جهات غائبة</div></div>
+  <div class="stat"><div class="stat-n">${pct}%</div><div class="stat-l">نسبة الحضور</div></div>
+</div>
+<div class="section-title">✅ الحاضرون</div>
+<table><thead><tr><th>#</th><th>الجهة</th><th>الاسم</th><th>الصفة</th><th>وقت الحضور</th><th>التوقيع</th></tr></thead>
+<tbody>${presRows}</tbody></table>
+${absentD.length?`<div class="section-title">❌ الجهات الغائبة</div>
+<table><thead><tr><th>#</th><th>الجهة</th><th>السبب</th><th>ملاحظة</th></tr></thead>
+<tbody>${absRows}</tbody></table>`:''}
+<div class="footer">طُبع بتاريخ ${new Date().toLocaleDateString('ar-EG')} — نظام الحضور الإلكتروني</div>
+<script>window.onload=()=>window.print()<\/script>
+</body></html>`;
+  const w=window.open('','_blank'); w.document.write(html); w.document.close();
+};
+
+// ════════════════════════════════════
+//  SEARCH IN ATTENDANCE
+// ════════════════════════════════════
+window.filterAttendance=function(){
+  const q=document.getElementById('attendanceSearch').value.trim().toLowerCase();
+  const rows=document.querySelectorAll('#presentTbody tr');
+  rows.forEach(r=>{ r.style.display=(!q||r.textContent.toLowerCase().includes(q))?'':'none'; });
+};
+
+// ════════════════════════════════════
+//  PROJECTOR — real-time
+// ════════════════════════════════════
+let projectorShowPresent=true;
+
+function initProjectorPage(mid){
+  document.querySelector('.tabs').style.display='none';
+  document.querySelector('.header').style.display='none';
+  document.body.style.background='#f5f5f7';
+  document.querySelector('.main').innerHTML='<div id="projRoot"></div>';
+
+  get(ref(db,'active_meeting')).then(snap=>{
+    if(!snap.exists()) return;
+    const data=snap.val();
+    const meetId=mid||data.id;
+    meetingStart=data.start;
+    DEPARTMENTS=JSON.parse(localStorage.getItem('depts_v7')||'[]');
+    // استمع real-time
+    onValue(ref(db,`meetings/${meetId}/records`),snap2=>{
+      attendance=snap2.exists()?snap2.val():{};
+      renderProjector();
+    });
+    // استمع للجهات
+    onValue(ref(db,'departments'),snap2=>{
+      if(snap2.exists()) DEPARTMENTS=Object.values(snap2.val());
+      renderProjector();
+    });
+  });
+}
+
+function renderProjector(){
+  const root=document.getElementById('projRoot');
+  if(!root) return;
+  const recs=Object.values(attendance).sort((a,b)=>a.timestamp-b.timestamp);
+  const deptNames=DEPARTMENTS.map(d=>d.name);
+  const presentD=new Set(recs.map(r=>r.dept));
+  const absentD=deptNames.filter(d=>!presentD.has(d));
+  const pct=deptNames.length?Math.round(presentD.size/deptNames.length*100):0;
+  const now=new Date().toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+
+  const presRows=recs.map((r,i)=>`
+    <tr style="border-bottom:1px solid #f0f0f2">
+      <td style="padding:13px 18px;color:#999;font-size:13px">${i+1}</td>
+      <td style="padding:13px 18px;font-weight:700;font-size:15px">${r.dept}</td>
+      <td style="padding:13px 18px;font-size:14px">${r.name||'—'}</td>
+      <td style="padding:13px 18px"><span style="padding:4px 13px;border-radius:20px;font-size:12px;font-weight:700;background:${r.role==='president'?'#0a0a0a':'#444'};color:#fff">${r.role==='president'?'🔵 رئيس':'🟡 نائب'}</span></td>
+      <td style="padding:13px 18px;color:#999;font-size:13px">${r.time}</td>
+    </tr>`).join('');
+
+  const absRows=absentD.map((d,i)=>`
+    <tr style="border-bottom:1px solid #f0f0f2">
+      <td style="padding:13px 18px;color:#999;font-size:13px">${i+1}</td>
+      <td style="padding:13px 18px;font-weight:700;font-size:15px;color:#cc2200">${d}</td>
+      <td style="padding:13px 18px"><span style="padding:4px 13px;border-radius:20px;font-size:12px;font-weight:700;background:#fff0ee;color:#cc2200">❌ لم تُسجَّل</span></td>
+    </tr>`).join('');
+
+  root.innerHTML=`
+  <style>@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap');
+  *{font-family:'Cairo',sans-serif;box-sizing:border-box}</style>
+  <div style="padding:18px">
+    <div style="background:#0a0a0a;border-radius:16px;padding:16px 22px;display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px">
+      <div style="font-size:17px;font-weight:900;color:#fff">🏛️ اجتماع المجلس التنفيذي — محافظة الغربية</div>
+      <div style="font-size:22px;font-weight:900;color:#fff">${now}</div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px">
+      <div style="background:#0a0a0a;border-radius:12px;padding:14px;text-align:center"><div style="font-size:32px;font-weight:900;color:#fff">${recs.length}</div><div style="font-size:10px;color:rgba(255,255,255,.5);margin-top:2px">إجمالي الأفراد</div></div>
+      <div style="background:#0a0a0a;border-radius:12px;padding:14px;text-align:center"><div style="font-size:32px;font-weight:900;color:#fff">${presentD.size}</div><div style="font-size:10px;color:rgba(255,255,255,.5);margin-top:2px">جهات حضرت</div></div>
+      <div style="background:#0a0a0a;border-radius:12px;padding:14px;text-align:center"><div style="font-size:32px;font-weight:900;color:#ff6b6b">${absentD.length}</div><div style="font-size:10px;color:rgba(255,255,255,.5);margin-top:2px">جهات غائبة</div></div>
+      <div style="background:#0a0a0a;border-radius:12px;padding:14px;text-align:center"><div style="font-size:32px;font-weight:900;color:#fff">${pct}%</div><div style="font-size:10px;color:rgba(255,255,255,.5);margin-top:2px">نسبة الحضور</div></div>
+    </div>
+    <div style="height:7px;background:#e5e5e7;border-radius:4px;margin-bottom:12px;overflow:hidden">
+      <div style="height:100%;background:#0a0a0a;width:${pct}%;border-radius:4px;transition:width .6s"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <button onclick="projectorShowPresent=true;renderProjector()" style="flex:1;padding:11px;border-radius:10px;border:2px solid ${projectorShowPresent?'#0a0a0a':'#e5e5e7'};background:${projectorShowPresent?'#0a0a0a':'#fff'};color:${projectorShowPresent?'#fff':'#0a0a0a'};font-family:'Cairo',sans-serif;font-size:14px;font-weight:700;cursor:pointer">✅ الحاضرون (${recs.length})</button>
+      <button onclick="projectorShowPresent=false;renderProjector()" style="flex:1;padding:11px;border-radius:10px;border:2px solid ${!projectorShowPresent?'#cc2200':'#e5e5e7'};background:${!projectorShowPresent?'#fff0ee':'#fff'};color:${!projectorShowPresent?'#cc2200':'#0a0a0a'};font-family:'Cairo',sans-serif;font-size:14px;font-weight:700;cursor:pointer">❌ لم يحضروا (${absentD.length})</button>
+    </div>
+    <div style="background:#fff;border:1px solid #e5e5e7;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)">
+      <div style="background:#0a0a0a;padding:12px 18px;font-size:14px;font-weight:800;color:#fff">${projectorShowPresent?`✅ الحاضرون — ${recs.length} فرد`:`❌ الغائبون — ${absentD.length} جهة`}</div>
+      <div style="overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:14px">
+          <thead><tr style="background:#f5f5f7">
+            ${projectorShowPresent
+              ?'<th style="padding:10px 18px;text-align:right;font-size:11px;color:#999">#</th><th style="padding:10px 18px;text-align:right;font-size:11px;color:#999">الجهة</th><th style="padding:10px 18px;text-align:right;font-size:11px;color:#999">الاسم</th><th style="padding:10px 18px;text-align:right;font-size:11px;color:#999">الصفة</th><th style="padding:10px 18px;text-align:right;font-size:11px;color:#999">الوقت</th>'
+              :'<th style="padding:10px 18px;text-align:right;font-size:11px;color:#999">#</th><th style="padding:10px 18px;text-align:right;font-size:11px;color:#999">الجهة</th><th style="padding:10px 18px;text-align:right;font-size:11px;color:#999">الحالة</th>'
+            }
+          </tr></thead>
+          <tbody>${projectorShowPresent?presRows:absRows}</tbody>
+        </table>
+      </div>
+    </div>
+  </div>`;
+}
+
+window.getProjectorLink=async function(){
+  const snap=await get(ref(db,'active_meeting'));
+  if(!snap.exists()) return;
+  const mid=snap.val().id||'';
+  const base=window.location.origin+window.location.pathname;
+  const link=`${base}?mode=projector&mid=${mid}`;
+  navigator.clipboard.writeText(link)
+    .then(()=>toast('✅ تم نسخ رابط البروجيكتور — يفتح مباشرة'))
+    .catch(()=>prompt('رابط البروجيكتور:',link));
+};
+
+// نسخ رابط المسجلين (بيتغير مع كل اجتماع)
+window.copyMeetingLink=async function(){
+  const snap=await get(ref(db,'active_meeting'));
+  if(!snap.exists()) return;
+  const token=snap.val().token||'';
+  const base=window.location.origin+window.location.pathname;
+  const link=`${base}?m=${token}`;
+  navigator.clipboard.writeText(link)
+    .then(()=>toast('✅ تم نسخ رابط التسجيل'))
+    .catch(()=>prompt('رابط التسجيل:',link));
+};
+// ════════════════════════════════════
+//  DONUT CHART
+// ════════════════════════════════════
+function drawChart(){
+  const canvas=document.getElementById('attendanceChart');
+  if(!canvas) return;
+  const deptNames=DEPARTMENTS.map(d=>d.name);
+  const presentD=new Set(Object.values(attendance).map(r=>r.dept));
+  const pres=presentD.size, abs=deptNames.length-pres, total=deptNames.length;
+  if(!total) return;
+  const ctx=canvas.getContext('2d');
+  const cx=canvas.width/2, cy=canvas.height/2, r=70, ri=45;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  // رسم الدونات
+  const slices=[
+    {val:pres,color:'#00d4aa'},
+    {val:abs,color:'#ff4d6d'}
+  ];
+  let angle=-Math.PI/2;
+  slices.forEach(s=>{
+    if(!s.val) return;
+    const sweep=s.val/total*2*Math.PI;
+    ctx.beginPath(); ctx.moveTo(cx,cy);
+    ctx.arc(cx,cy,r,angle,angle+sweep);
+    ctx.closePath(); ctx.fillStyle=s.color; ctx.fill();
+    angle+=sweep;
+  });
+  // الثقب
+  ctx.beginPath(); ctx.arc(cx,cy,ri,0,2*Math.PI);
+  ctx.fillStyle='#111827'; ctx.fill();
+  // النص في المنتصف
+  ctx.fillStyle='#e8edf5'; ctx.font='bold 18px Cairo';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(Math.round(pres/total*100)+'%',cx,cy-8);
+  ctx.font='11px Cairo'; ctx.fillStyle='#6b7a99';
+  ctx.fillText('حضور',cx,cy+12);
+}
+
+window.deleteRecord=async function(key){
+  if(!confirm('حذف هذا التسجيل؟')) return;
+  await remove(ref(db,`meetings/${currentMeetId}/records/${key}`));
+};
+
+// ════════════════════════════════════
+//  WHATSAPP
+// ════════════════════════════════════
+function renderWaPanel(){
+  const presentD=new Set(Object.values(attendance).map(r=>r.dept));
+  const absent=DEPARTMENTS.filter(d=>!presentD.has(d.name));
+  const container=document.getElementById('waAbsentList');
+  if(!absent.length){ container.innerHTML='<div class="empty-state" style="padding:30px"><div class="empty-icon">🎉</div><div class="empty-text">كل الجهات حضرت!</div></div>'; return; }
+  container.innerHTML=`
+    <div style="margin-bottom:14px">
+      <button class="btn btn-whatsapp" onclick="sendWaAll()" style="width:100%;justify-content:center;padding:13px;font-size:15px">
+        📲 إرسال للكل دفعة واحدة (${absent.length} جهة)
+      </button>
+    </div>
+    ${absent.map((d,i)=>`
+    <div class="wa-item">
+      <div class="wa-dept-name">❌ ${d.name}</div>
+      <input type="tel" class="wa-phone" id="waP_${i}" value="${d.phone||''}" placeholder="01xxxxxxxxx" dir="ltr"
+        onblur="saveWaPhone('${d.name.replace(/'/g,"\\'")}',this.value)">
+      <button class="btn btn-sm btn-whatsapp" onclick="sendWa(${i},'${d.name.replace(/'/g,"\\'")}')">📲</button>
+    </div>`).join('')}`;
+}
+
+window.saveWaPhone=async function(deptName,val){
+  const idx=DEPARTMENTS.findIndex(d=>d.name===deptName);
+  if(idx>=0){ DEPARTMENTS[idx].phone=val.trim(); await saveDepts(); }
+};
+window.sendWa=function(i,deptName){
+  const msg=document.getElementById('waMessage').value.trim();
+  if(!msg) return alert('من فضلك اكتب الرسالة أولاً');
+  const phone=document.getElementById(`waP_${i}`).value.trim().replace(/\D/g,'');
+  if(!phone) return alert('من فضلك أضف رقم الهاتف');
+  const text=msg.replace(/\{جهة\}/g,deptName);
+  const intl=phone.startsWith('0')?'2'+phone.slice(1):phone;
+  window.open(`https://wa.me/${intl}?text=${encodeURIComponent(text)}`,'_blank');
+};
+window.sendWaAll=function(){
+  const msg=document.getElementById('waMessage').value.trim();
+  if(!msg) return alert('من فضلك اكتب الرسالة أولاً');
+  const presentD=new Set(Object.values(attendance).map(r=>r.dept));
+  const absent=DEPARTMENTS.filter(d=>!presentD.has(d.name));
+  const withPhone=absent.filter(d=>d.phone);
+  if(!withPhone.length) return alert('لا يوجد أرقام هاتف مضافة');
+  const noPhone=absent.filter(d=>!d.phone);
+  if(noPhone.length && !confirm(`${noPhone.map(d=>d.name).join('، ')}\nمفيهاش رقم — هيتم الإرسال للباقين فقط. متابعة؟`)) return;
+  let i=0;
+  function next(){
+    if(i>=withPhone.length) return;
+    const d=withPhone[i];
+    const text=msg.replace(/\{جهة\}/g,d.name);
+    const phone=d.phone.replace(/\D/g,'');
+    const intl=phone.startsWith('0')?'2'+phone.slice(1):phone;
+    window.open(`https://wa.me/${intl}?text=${encodeURIComponent(text)}`,'_blank');
+    i++; if(i<withPhone.length) setTimeout(next,2000);
+  }
+  next();
+};
+
+// ════════════════════════════════════
+//  ARCHIVE
+// ════════════════════════════════════
+async function renderArchive(){
+  const snap=await get(ref(db,'meetings'));
+  const container=document.getElementById('archiveList');
+  if(!snap.exists()){ container.innerHTML='<div class="empty-state"><div class="empty-icon">📁</div><div class="empty-text">لا يوجد اجتماعات بعد</div></div>'; return; }
+  const meetings=snap.val();
+  const keys=Object.keys(meetings).reverse();
+  container.innerHTML=keys.map(k=>{
+    const m=meetings[k];
+    const recs=m.records?Object.values(m.records):[];
+    const pD=new Set(recs.map(r=>r.dept)).size;
+    const pct=DEPARTMENTS.length?Math.round(pD/DEPARTMENTS.length*100):0;
+    const active=k===currentMeetId;
+    return `
+    <div class="archive-item" style="${active?'border-color:var(--accent)':''}">
+      <div class="archive-info">
+        <div class="archive-title">${active?'🟢 ':''} ${m.name||'اجتماع'}</div>
+        <div class="archive-meta">${recs.length} فرد | ${pD} جهة حضرت | ${pct}% نسبة حضور</div>
+      </div>
+      <div class="archive-actions">
+        <button class="btn btn-sm btn-green" onclick="previewMeeting('${k}')">👁️ عرض</button>
+        <button class="btn btn-sm btn-green" onclick="exportMeetingExcel('${k}')">⬇️ Excel</button>
+        ${!active?`<button class="btn btn-sm btn-red" onclick="deleteMeeting('${k}')">🗑️</button>`:''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+window.previewMeeting=async function(k){
+  const snap=await get(ref(db,`meetings/${k}`));
+  if(!snap.exists()) return;
+  const m=snap.val();
+  const recs=m.records?Object.values(m.records).sort((a,b)=>a.timestamp-b.timestamp):[];
+  document.getElementById('archiveModalTitle').textContent=m.name||'اجتماع';
+  document.getElementById('archiveModalBody').innerHTML=`
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="background:var(--surface2)">
+        <th style="padding:9px;text-align:right">#</th><th style="padding:9px;text-align:right">الجهة</th>
+        <th style="padding:9px;text-align:right">الاسم</th><th style="padding:9px;text-align:right">الصفة</th>
+        <th style="padding:9px;text-align:right">الوقت</th>
+      </tr></thead>
+      <tbody>${recs.map((r,i)=>`
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:9px">${i+1}</td><td style="padding:9px;font-weight:600">${r.dept}</td>
+          <td style="padding:9px">${r.name}</td>
+          <td style="padding:9px"><span class="badge ${r.role==='president'?'b-pres':'b-dep'}">${r.role==='president'?'🔵 رئيس':'🟡 نائب'}</span></td>
+          <td style="padding:9px;color:var(--muted)">${r.time}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+  document.getElementById('archiveModal').classList.add('open');
+};
+window.closeArchiveModal=function(){ document.getElementById('archiveModal').classList.remove('open'); };
+
+window.deleteMeeting=async function(k){
+  if(!confirm('حذف هذا الاجتماع نهائياً؟')) return;
+  await remove(ref(db,`meetings/${k}`)); renderArchive();
+};
+
+// ════════════════════════════════════
+//  EXCEL
+// ════════════════════════════════════
+function makeExcel(meetingName,mStart,recs,deptNames){
+  const wb=XLSX.utils.book_new();
+  const presentD=new Set(recs.map(r=>r.dept));
+  const absentDepts=deptNames.filter(d=>!presentD.has(d));
+  const dateStr=new Date(mStart).toLocaleDateString('ar-EG');
+  const timeStr=new Date(mStart).toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'});
+
+  function applyStyles(ws){
+    const r=XLSX.utils.decode_range(ws['!ref']);
+    for(let R=r.s.r;R<=r.e.r;R++){
+      for(let C=r.s.c;C<=r.e.c;C++){
+        const a=XLSX.utils.encode_cell({r:R,c:C});
+        if(!ws[a]) continue;
+        ws[a].s=R<=1?{font:{bold:true,sz:R===0?14:12},alignment:{horizontal:'center',readingOrder:2}}:
+                 R===3?{font:{bold:true},alignment:{horizontal:'right',readingOrder:2},fill:{fgColor:{rgb:'1E2D45'}}}:
+                 C===0?{alignment:{horizontal:'center',readingOrder:2}}:
+                 {alignment:{horizontal:'right',readingOrder:2}};
+      }
+    }
+    ws['!rightToLeft']=true;
+  }
+
+  const ws1=XLSX.utils.aoa_to_sheet([
+    [meetingName],[`تاريخ: ${dateStr}   |   وقت البدء: ${timeStr}`],[],
+    ['#','الجهة','الاسم','الصفة','التاريخ','الوقت','ملاحظة'],
+    ...recs.map((r,i)=>[i+1,r.dept,r.name,r.roleLabel||r.role,r.date,r.time,r.note||''])
+  ]);
+  ws1['!cols']=[{wch:5},{wch:30},{wch:24},{wch:20},{wch:14},{wch:12},{wch:22}];
+  ws1['!merges']=[{s:{r:0,c:0},e:{r:0,c:6}},{s:{r:1,c:0},e:{r:1,c:6}}];
+  applyStyles(ws1);
+  XLSX.utils.book_append_sheet(wb,ws1,'الحاضرون');
+
+  const ws2=XLSX.utils.aoa_to_sheet([
+    ['الجهات الغائبة'],[`تاريخ: ${dateStr}`],[],['#','الجهة','الحالة'],
+    ...absentDepts.map((d,i)=>[i+1,d,'لم تحضر'])
+  ]);
+  ws2['!cols']=[{wch:5},{wch:30},{wch:16}];
+  ws2['!merges']=[{s:{r:0,c:0},e:{r:0,c:2}},{s:{r:1,c:0},e:{r:1,c:2}}];
+  applyStyles(ws2);
+  XLSX.utils.book_append_sheet(wb,ws2,'الغائبون');
+
+  const ws3=XLSX.utils.aoa_to_sheet([
+    ['ملخص الاجتماع'],[],
+    ['تاريخ الاجتماع',dateStr],['وقت البدء',timeStr],
+    ['إجمالي الجهات',deptNames.length],
+    ['عدد الأفراد الحاضرين',recs.length],
+    ['جهات حضرت',[...presentD].length],
+    ['جهات غائبة',absentDepts.length],
+    ['نسبة حضور الجهات',Math.round([...presentD].length/deptNames.length*100)+'%']
+  ]);
+  ws3['!cols']=[{wch:24},{wch:20}];
+  ws3['!merges']=[{s:{r:0,c:0},e:{r:0,c:1}}];
+  applyStyles(ws3);
+  XLSX.utils.book_append_sheet(wb,ws3,'الملخص');
+  XLSX.writeFile(wb,`${meetingName}.xlsx`);
+}
+
+window.exportExcel=function(){
+  const recs=Object.values(attendance).sort((a,b)=>a.timestamp-b.timestamp);
+  if(!recs.length) return toast('لا يوجد بيانات','error');
+  makeExcel(getMeetingName(),meetingStart,recs,DEPARTMENTS.map(d=>d.name));
+};
+window.exportMeetingExcel=async function(k){
+  const snap=await get(ref(db,`meetings/${k}`));
+  if(!snap.exists()) return;
+  const m=snap.val();
+  const recs=m.records?Object.values(m.records).sort((a,b)=>a.timestamp-b.timestamp):[];
+  makeExcel(m.name||'اجتماع',m.start,recs,DEPARTMENTS.map(d=>d.name));
+};
+
+// ════════════════════════════════════
+//  CLOSE / NEW MEETING
+// ════════════════════════════════════
+window.closeMeeting=async function(){
+  if(!confirm('إنهاء الاجتماع الحالي وأرشفته؟\nسيتم تصفير التسجيلات وقفل الرابط.')) return;
+  await set(ref(db,'active_meeting/closed'),true);
+  attendance={};
+  renderTable(); updateStamp();
+  toast('✅ تم إنهاء الاجتماع وأرشفته — الرابط القديم أُغلق','success',6000);
+};
+
+window.copyMeetingLink=async function(){
+  const snap=await get(ref(db,'active_meeting'));
+  if(!snap.exists()) return;
+  const token=snap.val().token||'';
+  const base=window.location.origin+window.location.pathname;
+  const link=`${base}?m=${token}`;
+  navigator.clipboard.writeText(link)
+    .then(()=>toast('🔗 تم نسخ رابط التسجيل — شاركه مع المشاركين','success'))
+    .catch(()=>prompt('رابط التسجيل:',link));
+};
+
+window.getProjectorLink=async function(){
+  const snap=await get(ref(db,'active_meeting'));
+  if(!snap.exists()) return;
+  const mid=snap.val().id;
+  const base=window.location.origin+window.location.pathname;
+  const link=`${base}?mode=projector&mid=${mid}`;
+  navigator.clipboard.writeText(link)
+    .then(()=>toast('📺 تم نسخ رابط البروجيكتور — افتحه على أي شاشة','info'))
+    .catch(()=>prompt('رابط البروجيكتور:',link));
+};
+window.newMeeting=async function(){
+  if(!confirm('أرشفة الاجتماع الحالي وبدء جديد برابط جديد؟')) return;
+  attendance={};
+  await createNewMeeting();
+  const snap=await get(ref(db,'active_meeting'));
+  const token=snap.val().token||'';
+  const base=window.location.origin+window.location.pathname;
+  navigator.clipboard.writeText(`${base}?m=${token}`).catch(()=>{});
+  switchTab('register');
+  toast('✅ تم بدء اجتماع جديد — تم نسخ الرابط الجديد 🔥');
+};
+window.clearAttendance=async function(){
+  if(!confirm('مسح كل بيانات الحضور؟')) return;
+  await remove(ref(db,`meetings/${currentMeetId}/records`));
+};
+
+// ════════════════════════════════════
+//  ADMIN DEPTS
+// ════════════════════════════════════
+function renderAdminDepts(){
+  const el=document.getElementById('adminDeptList');
+  if(!el) return;
+  el.innerHTML=DEPARTMENTS.map((d,i)=>`
+    <div style="display:flex;align-items:center;gap:8px;padding:9px 13px;background:var(--surface2);border-radius:10px;border:1px solid var(--border);margin-bottom:7px;flex-wrap:wrap">
+      <span style="font-weight:700;font-size:14px;flex:2">🏢 ${d.name}</span>
+      <input type="tel" value="${d.phone||''}" placeholder="رقم الهاتف" dir="ltr"
+        style="padding:6px 10px;background:var(--bg);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-family:'Cairo',sans-serif;font-size:12px;outline:none;width:130px"
+        onchange="updatePhone(${i},this.value)">
+      <button class="btn btn-sm btn-red" onclick="removeDept(${i})">حذف</button>
+    </div>`).join('');
+}
+window.updatePhone=async function(i,v){ DEPARTMENTS[i].phone=v.trim(); await saveDepts(); };
+window.addDept=async function(){
+  const name=document.getElementById('newDeptName').value.trim();
+  const phone=document.getElementById('newDeptPhone').value.trim();
+  if(!name) return;
+  if(DEPARTMENTS.find(d=>d.name===name)){ alert('الجهة موجودة!'); return; }
+  DEPARTMENTS.push({name,phone,code:''});
+  await saveDepts();
+  document.getElementById('newDeptName').value='';
+  document.getElementById('newDeptPhone').value='';
+};
+window.removeDept=async function(i){
+  if(!confirm(`حذف "${DEPARTMENTS[i].name}"؟`)) return;
+  DEPARTMENTS.splice(i,1); await saveDepts();
+};
+
+// إضافة جهات من نص (كل سطر جهة)
+window.importDeptsFromText=async function(){
+  const text=document.getElementById('bulkDeptInput').value.trim();
+  if(!text) return;
+  const lines=text.split('\n').map(l=>l.trim()).filter(l=>l);
+  let added=0;
+  for(const name of lines){
+    if(!DEPARTMENTS.find(d=>d.name===name)){ DEPARTMENTS.push({name,phone:'',code:''}); added++; }
+  }
+  await saveDepts();
+  document.getElementById('bulkDeptInput').value='';
+  toast(`✅ تم إضافة ${added} جهة`);
+};
+
+async function saveDepts(){
+  localStorage.setItem('depts_v7',JSON.stringify(DEPARTMENTS));
+  if(db) await set(ref(db,'departments'),Object.fromEntries(DEPARTMENTS.map((d,i)=>[i,d])));
+  renderDeptDd(); renderAdminDepts(); renderCodesTable();
+}
+
+// ════════════════════════════════════
+//  CODES
+// ════════════════════════════════════
+function genCode(){
+  const L='ABCDEFGHJKLMNPQRSTUVWXYZ';
+  return `${L[Math.floor(Math.random()*L.length)]}${Math.floor(Math.random()*10)}${Math.floor(Math.random()*10)}`;
+}
+window.generateAllCodes=async function(){
+  if(!confirm('توليد أكواد عشوائية جديدة لكل الجهات؟')) return;
+  const used=new Set();
+  DEPARTMENTS=DEPARTMENTS.map(d=>{ let c; do{c=genCode();}while(used.has(c)); used.add(c); return{...d,code:c}; });
+  await saveDepts();
+  toast('✅ تم توليد أكواد جديدة');
+};
+function renderCodesTable(){
+  const el=document.getElementById('codesTable');
+  if(!el) return;
+  if(!DEPARTMENTS.some(d=>d.code)){
+    el.innerHTML='<div style="text-align:center;padding:20px;color:var(--muted);font-size:13px">لا يوجد أكواد — اضغط "توليد للكل" أو أدخلها يدوياً</div>';
+    return;
+  }
+  el.innerHTML=DEPARTMENTS.map((d,i)=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface2);border-radius:10px;border:1px solid var(--border);margin-bottom:8px">
+      <span style="font-weight:700;font-size:13px;flex:2">🏢 ${d.name}</span>
+      <input type="text" value="${d.code||''}" maxlength="4" placeholder="كود" dir="ltr"
+        style="padding:8px 12px;background:var(--bg);border:1.5px solid var(--border);border-radius:8px;color:var(--accent);font-family:'Cairo',sans-serif;font-size:18px;font-weight:900;letter-spacing:4px;outline:none;width:85px;text-align:center;text-transform:uppercase"
+        onchange="updateCode(${i},this.value)">
+    </div>`).join('');
+}
+window.updateCode=async function(i,v){ DEPARTMENTS[i].code=v.trim().toUpperCase(); await saveDepts(); };
+window.exportCodesPDF=function(){
+  if(!DEPARTMENTS.some(d=>d.code)){ alert('ولّد الأكواد أولاً'); return; }
+  const rows=DEPARTMENTS.map((d,i)=>`<tr><td>${i+1}</td><td>${d.name}</td><td style="font-size:22px;font-weight:900;letter-spacing:6px;color:#0a5c3a">${d.code||'—'}</td></tr>`).join('');
+  const html=`<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8">
+<style>@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Cairo',sans-serif;padding:30px;background:#fff;color:#111}
+h1{text-align:center;font-size:20px;font-weight:900;margin-bottom:6px}.sub{text-align:center;font-size:13px;color:#666;margin-bottom:24px}
+table{width:100%;border-collapse:collapse;font-size:15px}thead th{background:#0a3d62;color:#fff;padding:12px 16px;text-align:right;font-weight:700}
+tbody tr:nth-child(even){background:#f0f7ff}td{padding:12px 16px;border-bottom:1px solid #dce8f5}td:first-child{text-align:center;color:#888;font-size:13px}
+.footer{text-align:center;margin-top:20px;font-size:11px;color:#aaa}@media print{body{padding:10px}}</style></head>
+<body><h1>أكواد الجهات — اجتماع المجلس التنفيذي لمحافظة الغربية</h1>
+<div class="sub">سري — للتوزيع على ممثلي الجهات فقط | ${new Date().toLocaleDateString('ar-EG',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}</div>
+<table><thead><tr><th>#</th><th>الجهة</th><th>الكود السري</th></tr></thead><tbody>${rows}</tbody></table>
+<div class="footer">هذه الوثيقة سرية — يُمنع تداولها خارج الجهة المعنية</div>
+<script>window.onload=()=>window.print()<\/script></body></html>`;
+  const w=window.open('','_blank'); w.document.write(html); w.document.close();
+};
+
+// ════════════════════════════════════
+//  AUTH
+// ════════════════════════════════════
+window.openAuthModal=function(mode,target){
+  if(Date.now()<lockedUntil){ alert(`🔒 انتظر ${Math.ceil((lockedUntil-Date.now())/1000)} ثانية`); return; }
+  authMode=mode; authTarget=target||null;
+  const cfg={
+    manager:{icon:'🔑',title:'رئيس الاجتماع',sub:'أدخل رمز رئيس الاجتماع'},
+    admin:{icon:'🔐',title:'وضع الأدمن',sub:'أدخل باسورد الأدمن'},
+    tab:{icon:'🔒',title:'منطقة محمية',sub:'أدخل رمز رئيس الاجتماع'},
+    disableAdmin:{icon:'🔓',title:'إلغاء وضع الأدمن',sub:'أدخل باسورد الأدمن للتأكيد'},
+  };
+  const c=cfg[mode];
+  document.getElementById('authIcon').textContent=c.icon;
+  document.getElementById('authTitle').textContent=c.title;
+  document.getElementById('authSub').textContent=c.sub;
+  document.getElementById('authInput').value='';
+  document.getElementById('authError').textContent='';
+  document.getElementById('authAttempts').textContent='';
+  document.getElementById('authSubmit').disabled=false;
+  document.getElementById('authOverlay').classList.add('open');
+  setTimeout(()=>document.getElementById('authInput').focus(),100);
+};
+window.closeAuthModal=function(){ document.getElementById('authOverlay').classList.remove('open'); };
+window.checkAuth=async function(){
+  if(Date.now()<lockedUntil) return;
+  const val=document.getElementById('authInput').value.trim();
+  if(!val) return;
+  const h=await sha256(val);
+  let ok=false;
+  if((authMode==='manager'||authMode==='tab')&&h===H_MGR){ unlockManager(); window.closeAuthModal(); switchTab(authTarget||'attendance'); ok=true; }
+  else if(authMode==='admin'&&h===H_ADM){ enableAdmin(); window.closeAuthModal(); ok=true; }
+  else if(authMode==='disableAdmin'&&h===H_ADM){ doDisableAdmin(); window.closeAuthModal(); ok=true; }
+  if(!ok){
+    failCount++;
+    document.getElementById('authInput').value='';
+    document.getElementById('authInput').focus();
+    if(failCount>=5){ lockedUntil=Date.now()+60000; failCount=0; document.getElementById('authError').textContent='🔒 مقفول لمدة دقيقة'; document.getElementById('authSubmit').disabled=true; setTimeout(()=>{ document.getElementById('authSubmit').disabled=false; document.getElementById('authError').textContent=''; },60000); }
+    else{ document.getElementById('authError').textContent='❌ رمز غير صحيح'; document.getElementById('authAttempts').textContent=`تبقى ${5-failCount} محاولة`; }
+  } else { failCount=0; }
+};
+function unlockManager(){
+  isUnlocked=true;
+  document.getElementById('tabAttendance').style.display='';
+  document.getElementById('tabArchive').style.display='';
+  document.getElementById('tabManagerBtn').style.display='none';
+  // أزرار الأدمن مخفية لرئيس الاجتماع
+  const adminBtns=document.getElementById('adminAttendanceBtns');
+  if(adminBtns) adminBtns.style.display='none';
+  renderTable();
+}
+
+function enableAdmin(){
+  isAdminMode=true;
+  document.getElementById('tabAdminToggle').textContent='🔓 إلغاء الأدمن';
+  document.getElementById('tabAdminToggle').style.color='var(--error)';
+  document.getElementById('adminBanner').style.display='flex';
+  document.getElementById('tabAdminPage').style.display='';
+  document.getElementById('tabWhatsapp').style.display='';
+  // إظهار أزرار الأدمن في الكشف
+  const adminBtns=document.getElementById('adminAttendanceBtns');
+  if(adminBtns) adminBtns.style.display='flex';
+  if(!isUnlocked) unlockManager();
+  switchTab('register');
+}
+window.disableAdmin=function(){
+  // لو مضغوطة من التاب مباشرة — اطلب الباسورد
+  openAuthModal('disableAdmin');
+};
+function doDisableAdmin(){
+  isAdminMode=false;
+  // مش بنلغي isUnlocked — رئيس الاجتماع يفضل شايف الكشف
+  document.getElementById('tabAdminToggle').textContent='🔐 أدمن';
+  document.getElementById('tabAdminToggle').style.color='var(--warn)';
+  document.getElementById('adminBanner').style.display='none';
+  document.getElementById('tabAdminPage').style.display='none';
+  document.getElementById('tabWhatsapp').style.display='none';
+  const adminBtns=document.getElementById('adminAttendanceBtns');
+  if(adminBtns) adminBtns.style.display='none';
+  // لو مش فاتح كرئيس اجتماع — اخفي تابات الكشف والأرشيف برضو
+  if(!isUnlocked){
+    document.getElementById('tabAttendance').style.display='none';
+    document.getElementById('tabArchive').style.display='none';
+  }
+  switchTab('register');
+}
+
+// ════════════════════════════════════
+//  TABS
+// ════════════════════════════════════
+window.switchTab=function switchTab(tab){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  const map={register:'tabRegister',attendance:'tabAttendance',whatsapp:'tabWhatsapp',archive:'tabArchive',adminpage:'tabAdminPage'};
+  if(map[tab]) document.getElementById(map[tab])?.classList.add('active');
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.getElementById('page-'+tab)?.classList.add('active');
+  if(tab==='attendance'){ renderTable(); updateStamp(); setTimeout(drawChart,100); }
+  if(tab==='whatsapp')  renderWaPanel();
+  if(tab==='archive')   renderArchive();
+  if(tab==='adminpage') { renderAdminDepts(); renderCodesTable(); renderFieldToggles(); }
+};
+window.switchSub=function(s){
+  currentSub=s;
+  document.getElementById('subPres').className='sub-tab'+(s==='present'?' act-pres':'');
+  document.getElementById('subAbs').className='sub-tab'+(s==='absent'?' act-abs':'');
+  document.getElementById('panelPres').style.display=s==='present'?'block':'none';
+  document.getElementById('panelAbs').style.display=s==='absent'?'block':'none';
+};
+window.selectRole=function(r){
+  selectedRole=r;
+  document.getElementById('btnPres').className='role-btn'+(r==='president'?' sel-pres':'');
+  document.getElementById('btnDep').className='role-btn'+(r==='deputy'?' sel-dep':'');
+};
+
+// ════════════════════════════════════
+//  ATTENDANCE PAGE ALERTS
+// ════════════════════════════════════
+function showAttendanceAlert(type,msg){
+  const id=type==='success'?'attendanceSuccessAlert':'attendanceErrorAlert';
+  const msgId=type==='success'?'attendanceSuccessMsg':'attendanceErrorMsg';
+  document.getElementById(msgId).textContent=msg;
+  document.getElementById(id).classList.add('show');
+  setTimeout(()=>document.getElementById(id).classList.remove('show'),4000);
+}
+
+// ════════════════════════════════════
+//  ORG IDENTITY
+// ════════════════════════════════════
+function loadOrgIdentity(){
+  onValue(ref(db,'settings/orgName'),snap=>{
+    const name=snap.exists()?snap.val():'نظام الحضور';
+    document.getElementById('headerTitle').textContent=name;
+    const inp=document.getElementById('orgNameInput');
+    if(inp) inp.value=name;
+    const prev=document.getElementById('previewName');
+    if(prev) prev.textContent=name;
+  });
+  onValue(ref(db,'settings/orgIcon'),snap=>{
+    const icon=snap.exists()?snap.val():'📋';
+    document.getElementById('headerLogo').textContent=icon;
+    const inp=document.getElementById('orgIconInput');
+    if(inp) inp.value=icon;
+    const prev=document.getElementById('previewLogo');
+    if(prev) prev.textContent=icon;
+  });
+}
+
+window.saveOrgIdentity=async function(){
+  const name=document.getElementById('orgNameInput').value.trim()||'نظام الحضور';
+  const icon=document.getElementById('orgIconInput').value.trim()||'📋';
+  await set(ref(db,'settings/orgName'),name);
+  await set(ref(db,'settings/orgIcon'),icon);
+  showAttendanceAlert('success','✅ تم حفظ هوية المنظمة');
+};
+
+// preview live
+document.addEventListener('input',e=>{
+  if(e.target.id==='orgNameInput'){
+    const p=document.getElementById('previewName');
+    if(p) p.textContent=e.target.value||'نظام الحضور';
+  }
+  if(e.target.id==='orgIconInput'){
+    const p=document.getElementById('previewLogo');
+    if(p) p.textContent=e.target.value||'📋';
+  }
+});
+
+// ════════════════════════════════════
+//  QR CODE
+// ════════════════════════════════════
+let currentQRLink='';
+window.generateQRCode=async function(){
+  const snap=await get(ref(db,'active_meeting'));
+  if(!snap.exists()) return;
+  const token=snap.val().token||'';
+  const base=window.location.origin+window.location.pathname;
+  currentQRLink=`${base}?m=${token}`;
+
+  const qrUrl=`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(currentQRLink)}&bgcolor=ffffff&color=000000&margin=10&format=png`;
+
+  const container=document.getElementById('qrDisplay');
+  const linkEl=document.getElementById('qrLinkDisplay');
+  container.innerHTML=`<img src="${qrUrl}" style="width:200px;height:200px;border-radius:12px" id="qrImg" crossorigin="anonymous">`;
+  linkEl.textContent=currentQRLink;
+};
+
+window.downloadQR=function(){
+  if(!currentQRLink){ alert('اضغط "توليد QR" أولاً'); return; }
+  const a=document.createElement('a');
+  a.href=`https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(currentQRLink)}&bgcolor=ffffff&color=000000&margin=15&format=png`;
+  a.download='qr-attendance.png';
+  a.click();
+};
+
+window.printQR=function(){
+  if(!currentQRLink){ alert('اضغط "توليد QR" أولاً'); return; }
+  const orgName=document.getElementById('headerTitle').textContent;
+  const w=window.open('','_blank');
+  w.document.write(`<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8">
+<style>body{font-family:'Cairo',sans-serif;text-align:center;padding:40px;background:#fff}
+h1{font-size:22px;font-weight:900;margin-bottom:8px}
+.sub{font-size:14px;color:#666;margin-bottom:24px}
+img{width:260px;height:260px;margin:0 auto;display:block}
+.inst{margin-top:20px;font-size:13px;color:#888;border:1px solid #e5e5e7;border-radius:8px;padding:10px 16px;display:inline-block}
+@media print{body{padding:20px}}</style></head>
+<body>
+<h1>${orgName}</h1>
+<div class="sub">${getMeetingName()}</div>
+<img src="https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(currentQRLink)}&bgcolor=ffffff&color=000000&margin=15">
+<div class="inst">📱 امسح الكود بكاميرا موبايلك لتسجيل حضورك</div>
+<script>window.onload=()=>window.print()<\/script>
+</body></html>`);
+  w.document.close();
+};
+// ════════════════════════════════════
+//  TOAST NOTIFICATIONS
+// ════════════════════════════════════
+function toast(msg, type='success', duration=4000){
+  // إنشاء container لو مش موجود
+  let container=document.getElementById('toastContainer');
+  if(!container){
+    container=document.createElement('div');
+    container.id='toastContainer';
+    container.style.cssText='position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:9999;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;width:min(420px,90vw)';
+    document.body.appendChild(container);
+  }
+
+  const colors={
+    success:{bg:'#0a0a0a',color:'#fff',icon:'✅'},
+    error:  {bg:'#cc2200',color:'#fff',icon:'⚠️'},
+    info:   {bg:'#0066ff',color:'#fff',icon:'ℹ️'},
+    warn:   {bg:'#b45309',color:'#fff',icon:'💡'},
+  };
+  const c=colors[type]||colors.success;
+
+  const el=document.createElement('div');
+  el.style.cssText=`background:${c.bg};color:${c.color};padding:13px 20px;border-radius:14px;font-family:'Cairo',sans-serif;font-size:14px;font-weight:600;display:flex;align-items:center;gap:10px;box-shadow:0 8px 30px rgba(0,0,0,.25);pointer-events:all;animation:toastIn .3s cubic-bezier(.175,.885,.32,1.275);width:100%;cursor:pointer`;
+  el.innerHTML=`<span style="font-size:18px">${c.icon}</span><span style="flex:1">${msg}</span><span style="opacity:.6;font-size:18px" onclick="this.parentElement.remove()">✕</span>`;
+  el.onclick=()=>el.remove();
+
+  container.appendChild(el);
+
+  // إضافة الـ animation في الـ style لو مش موجودة
+  if(!document.getElementById('toastStyle')){
+    const s=document.createElement('style');
+    s.id='toastStyle';
+    s.textContent=`@keyframes toastIn{from{opacity:0;transform:translateY(-12px) scale(.95)}to{opacity:1;transform:translateY(0) scale(1)}}
+    @keyframes toastOut{from{opacity:1;transform:scale(1)}to{opacity:0;transform:scale(.9)}}`;
+    document.head.appendChild(s);
+  }
+
+  // إخفاء تلقائي
+  setTimeout(()=>{
+    el.style.animation='toastOut .25s ease forwards';
+    setTimeout(()=>el.remove(), 250);
+  }, duration);
+}
+
+function showAlert(aId,mId,msg){
+  // الـ inline alerts في صفحة التسجيل
+  const msgEl=document.getElementById(mId);
+  const alertEl=document.getElementById(aId);
+  if(msgEl) msgEl.textContent=msg;
+  if(alertEl) alertEl.classList.add('show');
+  // toast في أي صفحة تانية
+  const type=aId.includes('success')?'success':'error';
+  toast(msg, type);
+}
+function hideAlerts(){
+  document.getElementById('successAlert')?.classList.remove('show');
+  document.getElementById('errorAlert')?.classList.remove('show');
+}
+window.hideAlerts=hideAlerts;
+window.showAdminSection=function(id,btn){
+  document.querySelectorAll('.admin-section').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.admin-sidebar-item').forEach(b=>b.classList.remove('active'));
+  document.getElementById('asec-'+id).classList.add('active');
+  btn.classList.add('active');
+  // render المحتوى المناسب
+  if(id==='depts') renderAdminDepts();
+  if(id==='codes') renderCodesTable();
+  if(id==='fields') renderFieldToggles();
+};
+</script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;900&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#ebebed;
+  --surface:#ffffff;
+  --surface2:#e2e2e5;
+  --surface3:#d8d8db;
+  --dark:#0a0a0a;
+  --dark2:#1a1a1a;
+  --dark3:#2a2a2a;
+  --accent:#0066ff;
+  --accent2:#0044cc;
+  --accent-light:#e8f0ff;
+  --text:#0a0a0a;
+  --text2:#2a2a2a;
+  --muted:#888888;
+  --border:#e5e5e7;
+  --border2:#d0d0d5;
+  --success:#00875a;--success-light:#e6f4ef;
+  --error:#cc2200;--error-light:#fff0ee;
+  --warn:#b45309;--warn-light:#fffbeb;--gold:#b45309;
+  --shadow:0 1px 2px rgba(0,0,0,.06),0 4px 12px rgba(0,0,0,.04);
+  --shadow-lg:0 8px 30px rgba(0,0,0,.1);
+  --shadow-xl:0 20px 60px rgba(0,0,0,.15);
+}
+body{font-family:'Cairo',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column}
+
+/* HEADER */
+.header{background:var(--dark);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.header-brand{display:flex;align-items:center;gap:12px}
+.logo-dot{width:40px;height:40px;border-radius:12px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:20px}
+.header-title{font-size:16px;font-weight:800;color:#fff}
+.header-sub{font-size:11px;color:rgba(255,255,255,.5)}
+.live-badge{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);border-radius:20px;padding:6px 14px;font-size:12px;color:#fff;font-weight:600}
+.live-dot{width:7px;height:7px;border-radius:50%;background:#00d084;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.7)}}
+
+/* TABS */
+.tabs{display:flex;background:var(--surface);border-bottom:2px solid var(--border);padding:0 20px;overflow-x:auto;gap:0}
+.tab{padding:14px 14px;font-family:'Cairo',sans-serif;font-size:13px;font-weight:600;color:var(--muted);background:none;border:none;border-bottom:2px solid transparent;margin-bottom:-2px;cursor:pointer;transition:all .2s;white-space:nowrap;display:flex;align-items:center;gap:5px}
+.tab.active{color:var(--dark);border-bottom-color:var(--dark)}
+.tab:hover:not(.active){color:var(--text2);background:var(--surface2)}
+
+/* MAIN */
+.main{flex:1;padding:20px;max-width:960px;margin:0 auto;width:100%}
+.page{display:none}.page.active{display:block}
+
+/* CARDS */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:16px;box-shadow:var(--shadow)}
+.card-title{font-size:15px;font-weight:800;margin-bottom:18px;display:flex;align-items:center;gap:8px;color:var(--text)}
+.card-dark{background:var(--dark2);border-color:var(--dark3);color:#fff}
+.card-dark .card-title{color:#fff}
+
+/* FORM */
+.form-group{margin-bottom:18px}
+.form-label{display:block;font-size:12px;font-weight:700;color:var(--text2);margin-bottom:7px;letter-spacing:.3px}
+.form-label span{color:var(--error)}
+.form-input{width:100%;padding:13px 15px;background:#e8e8eb;border:1.5px solid #d0d0d5;border-radius:12px;color:var(--text);font-family:'Cairo',sans-serif;font-size:14px;transition:all .2s;outline:none}
+.form-input:focus{border-color:var(--dark);background:var(--surface);box-shadow:0 0 0 3px rgba(0,0,0,.07)}
+.form-input::placeholder{color:var(--muted)}
+textarea.form-input{resize:vertical;min-height:85px;line-height:1.7}
+
+/* DEPT SEARCH */
+.search-wrap{position:relative}
+.search-icon{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:15px;pointer-events:none}
+.dept-dropdown{display:none;position:absolute;top:calc(100% + 4px);right:0;left:0;background:var(--surface);border:1.5px solid var(--dark);border-radius:12px;z-index:50;max-height:220px;overflow-y:auto;box-shadow:var(--shadow-lg)}
+.dept-dropdown.open{display:block}
+.dept-option{padding:11px 15px;cursor:pointer;font-size:14px;transition:background .12s;color:var(--text)}
+.dept-option:hover,.dept-option.hl{background:var(--dark);color:#fff}
+.dept-option.no-res{color:var(--muted);cursor:default}
+
+/* ROLE */
+.role-group{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.role-btn{padding:14px;border-radius:12px;border:1.5px solid var(--border);background:var(--surface2);color:var(--text2);font-family:'Cairo',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;text-align:center}
+.role-btn:hover{border-color:var(--dark);background:var(--dark);color:#fff}
+.role-btn.sel-pres{border-color:var(--dark);background:var(--dark);color:#fff}
+.role-btn.sel-dep{border-color:var(--dark3);background:var(--dark2);color:#fff}
+
+/* BUTTONS */
+.btn{padding:12px 20px;border:none;border-radius:10px;font-family:'Cairo',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:all .18s;display:inline-flex;align-items:center;gap:7px}
+.btn-primary{background:var(--dark);color:#fff;width:100%;justify-content:center;font-size:16px;padding:15px}
+.btn-primary:hover{background:var(--dark2);transform:translateY(-1px);box-shadow:var(--shadow-lg)}
+.btn-sm{padding:7px 14px;font-size:12px;border-radius:8px}
+.btn-green{background:var(--success-light);border:1px solid rgba(0,135,90,.2);color:var(--success)}.btn-green:hover{background:#d1f0e6}
+.btn-red{background:var(--error-light);border:1px solid rgba(204,34,0,.2);color:var(--error)}.btn-red:hover{background:#ffe0dc}
+.btn-yellow{background:var(--warn-light);border:1px solid rgba(180,83,9,.2);color:var(--warn)}.btn-yellow:hover{background:#fef3c7}
+.btn-blue{background:var(--accent-light);border:1px solid rgba(0,102,255,.2);color:var(--accent)}.btn-blue:hover{background:#d8e8ff}
+.btn-dark{background:var(--dark);color:#fff;border:none}.btn-dark:hover{background:var(--dark3)}
+.btn-whatsapp{background:#25D366;color:#fff;border:none}.btn-whatsapp:hover{background:#1da851}
+
+/* ALERTS */
+.alert{display:none;padding:13px 16px;border-radius:12px;font-size:13px;font-weight:600;margin-top:14px;align-items:center;gap:9px}
+.alert.show{display:flex}
+.alert-success{background:var(--success-light);border:1px solid rgba(0,135,90,.2);color:var(--success)}
+.alert-error{background:var(--error-light);border:1px solid rgba(204,34,0,.2);color:var(--error)}
+
+/* STATS */
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.stat-card{background:var(--dark);border-radius:14px;padding:16px;text-align:center}
+.stat-num{font-size:28px;font-weight:900;color:#fff}
+.stat-num.accent{color:#60a5ff}
+.stat-num.red{color:#ff6b6b}
+.stat-label{font-size:10px;color:rgba(255,255,255,.5);margin-top:4px;font-weight:600}
+
+/* STAMP */
+.stamp{background:var(--dark);border-radius:16px;padding:16px 20px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+.stamp-info{display:flex;flex-direction:column;gap:2px}
+.stamp-lbl{font-size:10px;color:rgba(255,255,255,.45);font-weight:600}
+.stamp-val{font-size:13px;font-weight:700;color:#fff}
+.stamp-badge{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);color:#fff;border-radius:9px;padding:5px 13px;font-size:12px;font-weight:700}
+
+/* SUB TABS */
+.sub-tabs{display:flex;gap:8px;margin-bottom:16px}
+.sub-tab{flex:1;padding:11px;border-radius:10px;border:1.5px solid var(--border);background:var(--surface);color:var(--muted);font-family:'Cairo',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .2s;text-align:center;box-shadow:var(--shadow)}
+.sub-tab.act-pres{border-color:var(--success);background:var(--success-light);color:var(--success)}
+.sub-tab.act-abs{border-color:var(--error);background:var(--error-light);color:var(--error)}
+
+/* TABLE */
+.tbl-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;overflow:hidden;margin-bottom:16px;box-shadow:var(--shadow)}
+.tbl-header{padding:14px 18px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px;background:var(--dark)}
+.tbl-title{font-weight:800;font-size:14px;color:#fff}
+.btn-row{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead th{background:var(--surface2);padding:11px 14px;text-align:right;font-size:11px;font-weight:700;color:var(--muted);border-bottom:1px solid var(--border)}
+tbody tr{border-bottom:1px solid var(--border);transition:background .12s}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:var(--surface2)}
+td{padding:11px 14px;vertical-align:middle;color:var(--text)}
+.row-num{width:26px;height:26px;border-radius:6px;background:var(--surface3);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--muted)}
+.badge{display:inline-flex;align-items:center;gap:3px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700}
+.b-pres{background:var(--dark);color:#fff}
+.b-dep{background:var(--dark3);color:#fff}
+.b-abs{background:var(--error-light);color:var(--error);border:1px solid rgba(204,34,0,.2)}
+.empty-state{padding:50px 20px;text-align:center;color:var(--muted)}
+.empty-icon{font-size:44px;margin-bottom:12px;opacity:.5}.empty-text{font-size:14px;font-weight:600}
+
+/* WHATSAPP */
+.wa-item{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--surface2);border-radius:12px;border:1px solid var(--border);margin-bottom:8px;gap:10px;flex-wrap:wrap}
+.wa-dept-name{font-weight:700;font-size:14px;flex:1;color:var(--text)}
+.wa-phone{padding:8px 12px;background:var(--surface);border:1.5px solid var(--border);border-radius:8px;color:var(--text);font-family:'Cairo',sans-serif;font-size:13px;outline:none;width:150px;direction:ltr}
+.wa-phone:focus{border-color:var(--dark)}
+
+/* ARCHIVE */
+.archive-item{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;background:var(--surface);border-radius:14px;border:1px solid var(--border);margin-bottom:10px;gap:12px;flex-wrap:wrap;box-shadow:var(--shadow);transition:all .2s}
+.archive-item:hover{box-shadow:var(--shadow-lg);border-color:var(--dark)}
+.archive-info{flex:1}
+.archive-title{font-weight:800;font-size:14px;margin-bottom:4px;color:var(--text)}
+.archive-meta{font-size:12px;color:var(--muted)}
+.archive-actions{display:flex;gap:7px}
+
+/* MODAL */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(6px);z-index:999;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:24px;padding:32px 28px;width:min(380px,92vw);text-align:center;box-shadow:var(--shadow-xl)}
+
+/* ADMIN SIDEBAR LAYOUT */
+.admin-layout{display:flex;gap:0;min-height:500px;background:var(--surface);border:1px solid var(--border);border-radius:16px;overflow:hidden;box-shadow:var(--shadow)}
+.admin-sidebar{width:200px;flex-shrink:0;background:var(--dark);padding:8px}
+.admin-sidebar-item{display:flex;align-items:center;gap:10px;padding:11px 14px;border-radius:10px;cursor:pointer;transition:all .15s;font-family:'Cairo',sans-serif;font-size:13px;font-weight:600;color:rgba(255,255,255,.6);border:none;background:none;width:100%;text-align:right}
+.admin-sidebar-item:hover{background:rgba(255,255,255,.08);color:#fff}
+.admin-sidebar-item.active{background:rgba(255,255,255,.15);color:#fff}
+.admin-sidebar-item .icon{font-size:16px;width:20px;text-align:center}
+.admin-sidebar-divider{height:1px;background:rgba(255,255,255,.08);margin:6px 8px}
+.admin-content{flex:1;padding:24px;overflow-y:auto;min-width:0}
+.admin-section{display:none}.admin-section.active{display:block}
+.admin-section-title{font-size:18px;font-weight:900;color:var(--text);margin-bottom:20px;padding-bottom:12px;border-bottom:2px solid var(--border)}
+
+/* SUCCESS PAGE */
+.success-page{text-align:center;padding:20px;animation:fadeUp .5s ease}
+@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+.success-circle{width:96px;height:96px;border-radius:50%;background:var(--dark);display:flex;align-items:center;justify-content:center;font-size:44px;margin:0 auto 20px;box-shadow:var(--shadow-lg);animation:popIn .5s cubic-bezier(.175,.885,.32,1.275)}
+@keyframes popIn{from{transform:scale(0)}to{transform:scale(1)}}
+.success-card{background:var(--surface2);border:1px solid var(--border);border-radius:16px;padding:18px 22px;margin:16px auto 0;max-width:380px;text-align:right}
+.success-row{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border)}
+.success-row:last-child{border-bottom:none}
+.success-row-label{font-size:12px;color:var(--muted);font-weight:600}
+.success-row-value{font-size:13px;font-weight:700;color:var(--text)}
+.success-locked{background:var(--dark);border-radius:12px;padding:12px 16px;margin-top:14px;font-size:13px;color:#fff;font-weight:600;display:flex;align-items:center;gap:8px;max-width:380px;margin-left:auto;margin-right:auto}
+
+@media(max-width:600px){
+  .stats-grid{grid-template-columns:repeat(2,1fr)}
+  .main{padding:12px}.card{padding:16px 14px}
+  thead th:nth-child(6),td:nth-child(6){display:none}
+  .stamp{flex-direction:column}
+  .header{padding:10px 14px}
+  .admin-layout{flex-direction:column}
+  .admin-sidebar{width:100%;display:flex;flex-wrap:nowrap;overflow-x:auto;padding:8px;gap:4px}
+  .admin-sidebar-item{white-space:nowrap;flex-shrink:0}
+  .admin-sidebar-divider{display:none}
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-brand">
+    <div class="logo-dot" id="headerLogo">📋</div>
+    <div>
+      <div class="header-title" id="headerTitle">نظام الحضور</div>
+      <div class="header-sub" id="dateDisplay"></div>
+    </div>
+  </div>
+  <div class="live-badge"><div class="live-dot"></div><span id="syncDot">جاري الاتصال...</span></div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" id="tabRegister"  onclick="switchTab('register')">✏️ تسجيل</button>
+  <button class="tab" id="tabAttendance"        onclick="switchTab('attendance')" style="display:none">📊 الكشف</button>
+  <button class="tab" id="tabWhatsapp"          onclick="switchTab('whatsapp')" style="display:none">💬 واتساب</button>
+  <button class="tab" id="tabArchive"           onclick="switchTab('archive')" style="display:none">🗂️ الأرشيف</button>
+  <button class="tab" id="tabAdminPage"         onclick="switchTab('adminpage')" style="display:none">⚙️ إعدادات</button>
+  <button class="tab" id="tabManagerBtn"        onclick="openAuthModal('manager')" style="color:var(--accent)">🔑 رئيس الاجتماع</button>
+  <button class="tab" id="tabAdminToggle"       onclick="isAdminMode?disableAdmin():openAuthModal('admin')" style="color:var(--warn)">🔐 أدمن</button>
+</div>
+
+<!-- AUTH MODAL -->
+<div class="modal-overlay" id="authOverlay">
+  <div class="modal-box">
+    <div id="authIcon" style="font-size:40px;margin-bottom:10px">🔒</div>
+    <div id="authTitle" style="font-size:19px;font-weight:800;margin-bottom:6px"></div>
+    <div id="authSub" style="color:var(--muted);font-size:13px;margin-bottom:20px;line-height:1.6"></div>
+    <input type="password" id="authInput" maxlength="10"
+      style="width:100%;padding:14px;text-align:center;font-size:26px;letter-spacing:8px;background:var(--surface2);border:1.5px solid var(--border);border-radius:11px;color:var(--text);font-family:'Cairo',sans-serif;outline:none"
+      placeholder="••••" onkeydown="if(event.key==='Enter')checkAuth()">
+    <div id="authAttempts" style="color:var(--warn);font-size:12px;margin-top:8px;min-height:18px"></div>
+    <div id="authError" style="color:var(--error);font-size:13px;margin-top:4px;min-height:18px;font-weight:600"></div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button onclick="closeAuthModal()" style="flex:1;padding:13px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--muted);font-family:'Cairo',sans-serif;font-size:14px;cursor:pointer">إلغاء</button>
+      <button id="authSubmit" onclick="checkAuth()" style="flex:1;padding:13px;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:10px;color:#fff;font-family:'Cairo',sans-serif;font-size:15px;font-weight:700;cursor:pointer">دخول ✓</button>
+    </div>
+  </div>
+</div>
+
+<!-- ARCHIVE MODAL -->
+<div class="modal-overlay" id="archiveModal">
+  <div class="modal-box" style="width:min(700px,95vw);text-align:right;max-height:90vh;overflow-y:auto">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <div style="font-size:17px;font-weight:800" id="archiveModalTitle"></div>
+      <button onclick="closeArchiveModal()" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;color:var(--muted);cursor:pointer;font-family:'Cairo',sans-serif">✕</button>
+    </div>
+    <div id="archiveModalBody"></div>
+  </div>
+</div>
+
+<div class="main">
+
+<!-- PROJECTOR PAGE -->
+<div class="page" id="page-projector" style="display:none;padding:0">
+  <div id="projContent">
+    <div style="text-align:center;padding:80px 20px;color:#888;font-family:'Cairo',sans-serif">
+      <div style="font-size:40px;margin-bottom:16px">📺</div>
+      <div style="font-size:16px">جاري تحميل البيانات...</div>
+    </div>
+  </div>
+</div>
+
+<!-- REGISTER -->
+<div class="page active" id="page-register">
+  <div id="adminBanner" style="display:none;align-items:center;gap:10px;background:rgba(255,77,109,.1);border:1px solid rgba(255,77,109,.3);border-radius:13px;padding:11px 16px;margin-bottom:14px;font-size:13px;font-weight:700;color:var(--error)">
+    <span style="font-size:18px">🔓</span><span>وضع الأدمن — يمكنك تسجيل الحضور بدلاً عن أي شخص</span>
+  </div>
+
+  <!-- رسالة الترحيب -->
+  <div id="welcomeBox" style="display:none;background:linear-gradient(135deg,rgba(0,212,170,.1),rgba(0,128,255,.1));border:1px solid rgba(0,212,170,.3);border-radius:14px;padding:14px 18px;margin-bottom:14px;text-align:center">
+    <div style="font-size:16px;font-weight:700;color:var(--accent)" id="welcomeMsg"></div>
+  </div>
+
+  <!-- زرار إعادة الشرح -->
+  <div style="text-align:left;margin-bottom:10px">
+    <button onclick="restartTour()" style="background:transparent;border:1px solid var(--border);border-radius:8px;padding:5px 12px;color:var(--muted);font-family:'Cairo',sans-serif;font-size:12px;cursor:pointer">❓ شرح خطوات التسجيل</button>
+  </div>
+  <div class="card">
+    <div style="text-align:center;margin-bottom:22px">
+      <div style="width:64px;height:64px;border-radius:17px;background:linear-gradient(135deg,rgba(0,212,170,.15),rgba(0,128,255,.15));border:1px solid rgba(0,212,170,.3);display:flex;align-items:center;justify-content:center;font-size:28px;margin:0 auto 12px">🏛️</div>
+      <div style="font-size:20px;font-weight:900;margin-bottom:5px">تسجيل الحضور</div>
+      <div style="color:var(--muted);font-size:13px">اختر جهتك ثم اكتب اسمك وصفتك</div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">🏢 الجهة <span>*</span></label>
+      <div class="search-wrap" id="deptWrap">
+        <input type="text" class="form-input" id="deptSearch" placeholder="ابحث أو اختر الجهة..." autocomplete="off"
+          oninput="filterDepts()" onfocus="openDeptDd()" onkeydown="deptNav(event)" style="padding-left:38px">
+        <span class="search-icon">🔍</span>
+        <div class="dept-dropdown" id="deptDd"></div>
+      </div>
+      <input type="hidden" id="deptVal">
+    </div>
+
+    <div class="form-group" id="nameGroup">
+      <label class="form-label">👤 الاسم الكامل <span>*</span></label>
+      <input type="text" class="form-input" id="nameInput" placeholder="اكتب اسمك الكامل هنا..." autocomplete="off">
+    </div>
+
+    <div class="form-group" id="roleGroup">
+      <label class="form-label" id="roleLabel">🎖️ الصفة في الاجتماع</label>
+      <div class="role-group">
+        <button class="role-btn" id="btnPres" onclick="selectRole('president')">🔵 رئيس الجهة</button>
+        <button class="role-btn" id="btnDep"  onclick="selectRole('deputy')">🟡 نائب عن الرئيس</button>
+      </div>
+    </div>
+
+    <div class="form-group" id="codeGroup" style="display:none">
+      <label class="form-label">🔑 الكود السري للجهة</label>
+      <input type="text" class="form-input" id="deptCode" placeholder="أدخل الكود..." maxlength="4"
+        style="text-align:center;font-size:22px;font-weight:900;letter-spacing:8px;text-transform:uppercase" autocomplete="off">
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">💬 ملاحظة (اختياري)</label>
+      <input type="text" class="form-input" id="noteInput" placeholder="أي ملاحظة إضافية...">
+    </div>
+
+    <button id="regBtn" class="btn btn-primary" onclick="registerAttendance()">✅ تسجيل الحضور</button>
+    <div class="alert alert-success" id="successAlert"><span>✅</span><span id="successMsg"></span></div>
+    <div class="alert alert-error"   id="errorAlert"><span>⚠️</span><span id="errorMsg"></span></div>
+  </div>
+</div>
+
+<!-- ATTENDANCE -->
+<div class="page" id="page-attendance">
+  <!-- Alert خاص بصفحة الكشف -->
+  <div class="alert alert-success" id="attendanceSuccessAlert" style="margin-bottom:12px"><span>✅</span><span id="attendanceSuccessMsg"></span></div>
+  <div class="alert alert-error"   id="attendanceErrorAlert"   style="margin-bottom:12px"><span>⚠️</span><span id="attendanceErrorMsg"></span></div>
+  <div class="stamp">
+    <div class="stamp-info"><div class="stamp-lbl">📅 تاريخ الاجتماع</div><div class="stamp-val" id="stDate">—</div></div>
+    <div class="stamp-info"><div class="stamp-lbl">🕐 بدأ الاجتماع</div><div class="stamp-val" id="stStart">—</div></div>
+    <div class="stamp-info"><div class="stamp-lbl">⏱️ أول تسجيل</div><div class="stamp-val" id="stFirst">—</div></div>
+    <div class="stamp-info"><div class="stamp-lbl">⏱️ آخر تسجيل</div><div class="stamp-val" id="stLast">—</div></div>
+    <div class="stamp-badge" id="stElapsed">—</div>
+  </div>
+  <div class="stats-grid">
+    <div class="stat-card"><div class="stat-num" id="stPersons">0</div><div class="stat-label">👤 إجمالي الأفراد</div></div>
+    <div class="stat-card"><div class="stat-num" id="stPresent">0</div><div class="stat-label">✅ جهات حضرت</div></div>
+    <div class="stat-card"><div class="stat-num" id="stAbsent" style="background:linear-gradient(135deg,#ff4d6d,#ff8c00);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text">0</div><div class="stat-label">❌ جهات غائبة</div></div>
+    <div class="stat-card"><div class="stat-num" id="stPct">0%</div><div class="stat-label">📊 نسبة الحضور</div></div>
+  </div>
+  <div class="sub-tabs">
+    <button class="sub-tab act-pres" id="subPres" onclick="switchSub('present')">✅ الحاضرون (<span id="cntPres">0</span>)</button>
+    <button class="sub-tab"          id="subAbs"  onclick="switchSub('absent')">❌ لم يحضروا (<span id="cntAbs">0</span>)</button>
+  </div>
+  <div id="panelPres">
+    <!-- مخطط دائري + بحث -->
+    <div style="display:flex;gap:14px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+      <canvas id="attendanceChart" width="160" height="160" style="flex-shrink:0"></canvas>
+      <div style="flex:1;min-width:180px">
+        <input type="text" id="attendanceSearch" class="form-input" placeholder="🔍 ابحث باسم أو جهة..."
+          oninput="filterAttendance()" style="margin-bottom:10px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <div style="display:flex;align-items:center;gap:6px;font-size:13px"><span style="width:12px;height:12px;border-radius:50%;background:#00d4aa;display:inline-block"></span>حضر</div>
+          <div style="display:flex;align-items:center;gap:6px;font-size:13px"><span style="width:12px;height:12px;border-radius:50%;background:#ff4d6d;display:inline-block"></span>غائب</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tbl-card">
+      <div class="tbl-header">
+        <div class="tbl-title">✅ قائمة الحاضرين</div>
+        <div class="btn-row">
+          <!-- أزرار رئيس الاجتماع فقط -->
+          <button class="btn btn-sm btn-dark" onclick="openDisplayMode(true)">📺 بروجيكتور</button>
+          <button class="btn btn-sm btn-dark" onclick="getProjectorLink()" style="background:var(--dark3)">🔗 رابط البروجيكتور</button>
+          <!-- أزرار الأدمن فقط -->
+          <span id="adminAttendanceBtns" style="display:none;gap:7px;align-items:center;flex-wrap:wrap">
+            <button class="btn btn-sm btn-green" onclick="copyMeetingLink()">🔗 الرابط</button>
+            <button class="btn btn-sm btn-green" onclick="printAttendance()">🖨️ طباعة</button>
+            <button class="btn btn-sm btn-green" onclick="exportExcel()">⬇️ Excel</button>
+            <button class="btn btn-sm btn-red"   onclick="clearAttendance()">🗑️ مسح</button>
+            <button class="btn btn-sm" style="background:var(--error-light);border:1px solid rgba(204,34,0,.3);color:var(--error)" onclick="closeMeeting()">🔒 إنهاء</button>
+          </span>
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+        <table><thead><tr><th>#</th><th>الجهة</th><th>الاسم</th><th>الصفة</th><th>الوقت</th><th></th></tr></thead>
+        <tbody id="presentTbody"></tbody></table>
+        <div class="empty-state" id="emptyPres"><div class="empty-icon">📭</div><div class="empty-text">لا يوجد حضور مسجل بعد</div></div>
+      </div>
+    </div>
+  </div>
+  <div id="panelAbs" style="display:none">
+    <div class="tbl-card">
+      <div class="tbl-header"><div class="tbl-title">❌ الجهات الغائبة</div></div>
+      <div style="overflow-x:auto">
+        <table><thead><tr><th>#</th><th>الجهة</th><th>الحالة</th></tr></thead>
+        <tbody id="absentTbody"></tbody></table>
+        <div class="empty-state" id="emptyAbs" style="display:none"><div class="empty-icon">🎉</div><div class="empty-text">جميع الجهات حضرت!</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- WHATSAPP -->
+<div class="page" id="page-whatsapp">
+  <div class="card">
+    <div class="card-title">💬 إرسال تذكير واتساب للغائبين</div>
+    <div class="form-group">
+      <label class="form-label">✍️ صِغ رسالتك — استخدم <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;color:var(--accent)">{جهة}</code> ليُستبدل باسم الجهة</label>
+      <textarea class="form-input" id="waMessage" placeholder="مثال: السلام عليكم، نذكركم بحضور اجتماع اليوم. الجهة: {جهة}. شكراً."></textarea>
+    </div>
+    <div style="background:rgba(37,211,102,.07);border:1px solid rgba(37,211,102,.2);border-radius:11px;padding:13px;margin-bottom:16px;font-size:13px;color:#86efac;line-height:1.8">
+      💡 أضف رقم الهاتف لكل جهة ثم اضغط زرار الواتساب
+    </div>
+    <div id="waAbsentList"></div>
+  </div>
+</div>
+
+<!-- ARCHIVE -->
+<div class="page" id="page-archive">
+  <div class="card">
+    <div class="card-title">🗂️ أرشيف الاجتماعات</div>
+    <div id="archiveList"><div class="empty-state"><div class="empty-icon">📁</div><div class="empty-text">جاري التحميل...</div></div></div>
+  </div>
+</div>
+
+<!-- ADMIN -->
+<div class="page" id="page-adminpage">
+  <div class="admin-layout">
+
+    <!-- SIDEBAR -->
+    <div class="admin-sidebar">
+      <button class="admin-sidebar-item active" onclick="showAdminSection('welcome',this)">
+        <span class="icon">📢</span> رسالة الترحيب
+      </button>
+      <button class="admin-sidebar-item" onclick="showAdminSection('identity',this)">
+        <span class="icon">🏛️</span> هوية المنظمة
+      </button>
+      <button class="admin-sidebar-item" onclick="showAdminSection('qrcode',this)">
+        <span class="icon">📱</span> QR Code
+      </button>
+      <button class="admin-sidebar-item" onclick="showAdminSection('fields',this)">
+        <span class="icon">🔧</span> الحقول الإلزامية
+      </button>
+      <div class="admin-sidebar-divider"></div>
+      <button class="admin-sidebar-item" onclick="showAdminSection('depts',this)">
+        <span class="icon">🏢</span> إدارة الجهات
+      </button>
+      <button class="admin-sidebar-item" onclick="showAdminSection('codes',this)">
+        <span class="icon">🔑</span> الأكواد السرية
+      </button>
+      <div class="admin-sidebar-divider"></div>
+      <button class="admin-sidebar-item" onclick="showAdminSection('meeting',this)">
+        <span class="icon">📅</span> إدارة الاجتماع
+      </button>
+      <div class="admin-sidebar-divider"></div>
+      <button class="admin-sidebar-item" onclick="showAdminSection('firebase',this)">
+        <span class="icon">🔥</span> Firebase
+      </button>
+    </div>
+
+    <!-- CONTENT -->
+    <div class="admin-content">
+
+      <!-- هوية المنظمة -->
+      <div class="admin-section" id="asec-identity">
+        <div class="admin-section-title">🏛️ هوية المنظمة</div>
+        <div class="form-group">
+          <label class="form-label">اسم المنظمة / المحافظة</label>
+          <input type="text" class="form-input" id="orgNameInput" placeholder="مثال: محافظة الغربية" oninput="updateOrgPreview()">
+        </div>
+        <div class="form-group">
+          <label class="form-label">أيقونة أو رمز (emoji)</label>
+          <input type="text" class="form-input" id="orgIconInput" placeholder="مثال: 🏛️" maxlength="4"
+            style="font-size:28px;text-align:center;width:80px" oninput="updateOrgPreview()">
+        </div>
+        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:14px">
+          <div style="font-size:12px;color:var(--muted);margin-bottom:8px;font-weight:600">معاينة الهيدر:</div>
+          <div style="background:#0a0a0a;border-radius:10px;padding:12px 16px;display:flex;align-items:center;gap:10px">
+            <div id="previewLogo" style="width:36px;height:36px;border-radius:9px;background:#0066ff;display:flex;align-items:center;justify-content:center;font-size:18px">📋</div>
+            <div id="previewName" style="font-size:15px;font-weight:800;color:#fff">نظام الحضور</div>
+          </div>
+        </div>
+        <button class="btn btn-sm btn-dark" onclick="saveOrgIdentity()">💾 حفظ</button>
+      </div>
+
+      <!-- QR Code -->
+      <div class="admin-section" id="asec-qrcode">
+        <div class="admin-section-title">📱 QR Code للتسجيل</div>
+        <div style="text-align:center;padding:20px">
+          <div id="qrDisplay" style="margin:0 auto 16px;width:220px;height:220px;background:var(--surface2);border:1px solid var(--border);border-radius:16px;display:flex;align-items:center;justify-content:center">
+            <div style="color:var(--muted);font-size:13px">اضغط لتوليد الـ QR</div>
+          </div>
+          <div id="qrLinkDisplay" style="font-size:12px;color:var(--muted);margin-bottom:16px;direction:ltr;word-break:break-all"></div>
+          <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+            <button class="btn btn-sm btn-dark" onclick="generateQRCode()">🔄 توليد QR</button>
+            <button class="btn btn-sm btn-green" onclick="downloadQR()">⬇️ تحميل الصورة</button>
+            <button class="btn btn-sm btn-green" onclick="printQR()">🖨️ طباعة</button>
+          </div>
+        </div>
+        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px;font-size:13px;color:var(--muted);line-height:1.8">
+          💡 امسح الـ QR بكاميرا الموبايل — بيفتح صفحة التسجيل مباشرة. اطبعه وحطه على باب قاعة الاجتماع.
+        </div>
+      </div>
+
+      <!-- رسالة الترحيب -->
+      <div class="admin-section" id="asec-welcome">
+        <div class="admin-section-title">📢 رسالة الترحيب</div>
+        <div class="form-group">
+          <label class="form-label">النص اللي بيظهر فوق صفحة التسجيل</label>
+          <input type="text" class="form-input" id="welcomeMsgInput" placeholder="مثال: أهلاً بكم في اجتماع المجلس التنفيذي — مايو 2026">
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-sm btn-dark" onclick="saveWelcomeMsg()">💾 حفظ الرسالة</button>
+          <button class="btn btn-sm btn-yellow" onclick="restartTour();switchTab('register')">❓ معاينة الشرح التوجيهي</button>
+        </div>
+      </div>
+
+      <!-- الحقول الإلزامية -->
+      <div class="admin-section" id="asec-fields">
+        <div class="admin-section-title">🔧 الحقول الإلزامية في التسجيل</div>
+        <div id="fieldToggles"></div>
+      </div>
+
+      <!-- إدارة الجهات -->
+      <div class="admin-section" id="asec-depts">
+        <div class="admin-section-title">🏢 إدارة الجهات وأرقام الهاتف</div>
+        <div id="adminDeptList"></div>
+        <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+          <input type="text" class="form-input" id="newDeptName" placeholder="اسم الجهة الجديدة..." style="flex:2;min-width:150px" onkeydown="if(event.key==='Enter')addDept()">
+          <input type="tel" class="form-input" id="newDeptPhone" placeholder="رقم الهاتف" style="flex:1;min-width:110px;direction:ltr">
+          <button class="btn btn-sm btn-dark" onclick="addDept()" style="white-space:nowrap">+ إضافة</button>
+        </div>
+        <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+          <div style="font-size:13px;font-weight:700;margin-bottom:8px;color:var(--muted)">📋 إضافة جهات بالجملة (كل جهة في سطر)</div>
+          <textarea class="form-input" id="bulkDeptInput" placeholder="مديرية التربية والتعليم&#10;مديرية الصحة&#10;..." style="min-height:110px;font-size:13px"></textarea>
+          <button class="btn btn-sm btn-dark" onclick="importDeptsFromText()" style="margin-top:8px">📥 استيراد الجهات</button>
+        </div>
+      </div>
+
+      <!-- الأكواد -->
+      <div class="admin-section" id="asec-codes">
+        <div class="admin-section-title">🔑 الأكواد السرية للجهات</div>
+        <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
+          <button class="btn btn-sm btn-dark" onclick="generateAllCodes()">⚡ توليد أكواد عشوائية للكل</button>
+          <button class="btn btn-sm btn-yellow" onclick="exportCodesPDF()">📄 تصدير PDF</button>
+        </div>
+        <div id="codesTable"></div>
+      </div>
+
+      <!-- إدارة الاجتماع -->
+      <div class="admin-section" id="asec-meeting">
+        <div class="admin-section-title">📅 إدارة الاجتماع</div>
+
+        <div style="background:var(--error-light);border:1px solid rgba(204,34,0,.15);border-radius:14px;padding:18px;margin-bottom:14px">
+          <div style="font-size:14px;font-weight:800;color:var(--error);margin-bottom:6px">🔒 إنهاء الاجتماع الحالي</div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.8">ينهي الاجتماع ويُحفظه في الأرشيف. الرابط الحالي يُقفل.</p>
+          <button class="btn btn-sm btn-red" onclick="closeMeeting()">🔒 إنهاء وأرشفة الاجتماع</button>
+        </div>
+
+        <div style="background:var(--warn-light);border:1px solid rgba(180,83,9,.15);border-radius:14px;padding:18px">
+          <div style="font-size:14px;font-weight:800;color:var(--warn);margin-bottom:6px">🆕 بدء اجتماع جديد</div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.8">يبدأ اجتماع جديد برابط جديد. لو الحالي شغال بيُنهيه تلقائياً.</p>
+          <button class="btn btn-sm btn-yellow" onclick="newMeeting()">▶️ بدء اجتماع جديد</button>
+        </div>
+      </div>
+
+      <!-- Firebase -->
+      <div class="admin-section" id="asec-firebase">
+        <div class="admin-section-title">🔥 حالة Firebase</div>
+        <div id="fbStatus" style="font-size:14px;font-weight:700;margin-bottom:16px">جاري التحقق...</div>
+        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px;font-size:13px;color:var(--muted);line-height:1.8">
+          Firebase هو قاعدة البيانات اللي بتحفظ كل التسجيلات وبتزامنها بين كل الأجهزة في نفس اللحظة.
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+</div>
+
+<script>
+var isAdminMode=false;
+setInterval(()=>{
+  const el=document.getElementById('fbStatus');
+  if(el){ el.textContent=window.fbConnected?'✅ متصل — البيانات تُحفظ مباشرة':'⚠️ غير متصل حالياً'; el.style.color=window.fbConnected?'var(--success)':'var(--warn)'; }
+},2000);
+</script>
+</body>
+</html>
